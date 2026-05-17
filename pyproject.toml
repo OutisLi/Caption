@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "caption"
+version = "0.1.0"
+description = "Local ASR and OpenAI-compatible bilingual subtitle generator."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "mlx-qwen3-asr[aligner]",
+    "openai>=1.0",
+    "tqdm>=4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.8",
+]
+
+[project.scripts]
+caption = "caption.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

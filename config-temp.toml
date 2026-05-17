@@ -1,0 +1,28 @@
+[llm]
+api_key = "YOUR_API_KEY"
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
+enable_thinking = true
+reasoning_effort = "high"
+concurrency = 100
+optimization_retries = 10
+
+[asr]
+model = "models/asr/Qwen3-ASR-1.7B-8bit"
+aligner_model = "models/asr/Qwen3-ForcedAligner-0.6B-8bit"
+model_cache_dir = "models/asr"
+
+[output]
+dir = "outputs"
+save_asr_json = true
+
+[subtitle]
+translation_position = "bottom"
+max_chars_per_cue = 60
+max_seconds_per_cue = 6.0
+optimization_window_seconds = 30.0
+max_optimized_seconds = 6.0
+max_optimized_target_chars = 25
+min_optimized_seconds = 2.5
+optimization_pause_seconds = 1.0
+optimize = true
