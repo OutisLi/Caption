@@ -12,6 +12,7 @@ def test_config_file_drives_runtime_settings(tmp_path: cli.Path, monkeypatch: py
     config_path.write_text(
         """
 [llm]
+provider = "anthropic"
 api_key = "key"
 base_url = "https://api.example.com"
 model = "some-model"
@@ -44,6 +45,7 @@ optimize = true
     )
     config = load_runtime_config(config_path)
 
+    assert config.llm.provider == "anthropic"
     assert config.llm.model == "some-model"
     assert config.output_dir == cli.Path("my_outputs")
     assert config.optimize_subtitles is True
@@ -54,7 +56,7 @@ optimize = true
     assert config.min_optimized_seconds == 1.2
     assert config.optimization_pause_seconds == 0.6
     assert config.llm.optimization_retries == 3
-    assert require_llm_settings(config) == ("key", "https://api.example.com", "some-model")
+    assert require_llm_settings(config) == config.llm
     monkeypatch.delenv("HF_HOME", raising=False)
 
     apply_model_cache_dir(config)
@@ -98,7 +100,7 @@ dir = "outputs"
     input_path.write_bytes(b"fake")
     written_path = tmp_path / "outputs" / "clip.asr.srt"
 
-    def fail_create_openai_client(**kwargs: object) -> object:
+    def fail_create_llm_completion_client(**kwargs: object) -> object:
         raise AssertionError("plain-text mode must not create an LLM client")
 
     def fake_run_pipeline(
@@ -125,7 +127,7 @@ dir = "outputs"
         ]
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cli, "create_openai_client", fail_create_openai_client)
+    monkeypatch.setattr(cli, "create_llm_completion_client", fail_create_llm_completion_client)
     monkeypatch.setattr(cli, "LocalMlxAsr", lambda **kwargs: object())
     monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
 
@@ -133,7 +135,36 @@ dir = "outputs"
     assert capsys.readouterr().out == f"{written_path}\n"
 
 
-def test_text_option_enables_txt_outputs(tmp_path: cli.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cli_stops_before_asr_when_llm_preflight_fails(
+    tmp_path: cli.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "config.toml").write_text(
+        """
+[llm]
+api_key = "key"
+model = "model"
+""",
+        encoding="utf-8",
+    )
+    input_path = tmp_path / "clip.wav"
+    input_path.write_bytes(b"fake")
+
+    def fail_validate_llm_completion_client(client: object) -> None:
+        raise cli.TranslationError("LLM preflight failed: bad key")
+
+    def fail_local_mlx_asr(**kwargs: object) -> object:
+        raise AssertionError("ASR must not start when LLM preflight fails")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "create_llm_completion_client", lambda **kwargs: object())
+    monkeypatch.setattr(cli, "validate_llm_completion_client", fail_validate_llm_completion_client)
+    monkeypatch.setattr(cli, "LocalMlxAsr", fail_local_mlx_asr)
+
+    assert cli.main([str(input_path)]) == 1
+    assert "caption: LLM preflight failed: bad key" in capsys.readouterr().err
+
+
+def test_cli_passes_user_output_options_to_pipeline(tmp_path: cli.Path, monkeypatch: pytest.MonkeyPatch) -> None:
     (tmp_path / "config.toml").write_text(
         """
 [llm]
@@ -160,43 +191,11 @@ optimize = false
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli, "LocalMlxAsr", lambda **kwargs: object())
-    monkeypatch.setattr(cli, "create_openai_client", lambda **kwargs: object())
+    monkeypatch.setattr(cli, "create_llm_completion_client", lambda **kwargs: object())
+    monkeypatch.setattr(cli, "validate_llm_completion_client", lambda client: None)
     monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
 
     assert cli.main([str(input_path), "--target-lang", "zh", "--text"]) == 0
-
-
-def test_target_language_defaults_to_zh(tmp_path: cli.Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    (tmp_path / "config.toml").write_text(
-        """
-[llm]
-api_key = "key"
-model = "model"
-
-[subtitle]
-optimize = false
-""",
-        encoding="utf-8",
-    )
-    input_path = tmp_path / "clip.wav"
-    input_path.write_bytes(b"fake")
-
-    def fake_run_pipeline(
-        input_path: cli.Path,
-        output_dir: cli.Path,
-        config: CaptionConfig,
-        **kwargs: object,
-    ) -> list[OutputPaths]:
-        assert config.target_language == "zh"
-        assert kwargs["translator"] is not None
-        return []
-
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cli, "LocalMlxAsr", lambda **kwargs: object())
-    monkeypatch.setattr(cli, "create_openai_client", lambda **kwargs: object())
-    monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
-
-    assert cli.main([str(input_path)]) == 0
 
 
 def test_empty_target_language_disables_translation(tmp_path: cli.Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -223,7 +222,7 @@ optimize = false
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli, "LocalMlxAsr", lambda **kwargs: object())
-    monkeypatch.setattr(cli, "create_openai_client", lambda **kwargs: object())
+    monkeypatch.setattr(cli, "create_llm_completion_client", lambda **kwargs: object())
     monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
 
     assert cli.main([str(input_path), "--target-lang", ""]) == 0

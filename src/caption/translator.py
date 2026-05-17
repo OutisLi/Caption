@@ -1,10 +1,12 @@
-"""OpenAI-compatible LLM subtitle translation and optimization."""
+"""LLM subtitle translation and optimization."""
 
 import asyncio
+import json
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, TypeVar
+from typing import Any, Protocol, TypeVar
 
+from anthropic import AnthropicError, AsyncAnthropic
 from openai import AsyncOpenAI, OpenAIError
 
 from caption.llm_json import (
@@ -12,12 +14,136 @@ from caption.llm_json import (
     apply_translations,
     parse_optimized_segments_response,
     parse_translation_response,
+    strip_markdown_json,
 )
 from caption.progress import log_step, progress_gather
 from caption.prompts import build_optimization_prompt, build_translation_prompt
 from caption.types import SubtitleCue, WordSpan
 
 T = TypeVar("T")
+ANTHROPIC_MAX_TOKENS = 8192
+LLM_PREFLIGHT_SYSTEM_PROMPT = "You validate LLM connectivity and return only valid JSON."
+LLM_PREFLIGHT_USER_PROMPT = 'Return exactly this JSON object: {"ok": true}'
+
+
+class JsonCompletionClient(Protocol):
+    """Provider-neutral JSON completion client."""
+
+    async def complete_json(self, system_prompt: str, user_prompt: str) -> str:
+        """
+        Complete a JSON-only prompt pair.
+
+        Parameters
+        ----------
+        system_prompt : str
+            System instruction.
+        user_prompt : str
+            User task prompt.
+
+        Returns
+        -------
+        str
+            Raw JSON text from the provider.
+        """
+
+
+@dataclass(frozen=True)
+class OpenAIChatCompletionClient:
+    """OpenAI-compatible chat completion adapter."""
+
+    client: Any
+    model: str
+    enable_thinking: bool = True
+    reasoning_effort: str = "high"
+
+    async def complete_json(self, system_prompt: str, user_prompt: str) -> str:
+        """
+        Complete a JSON task with an OpenAI-compatible chat API.
+
+        Parameters
+        ----------
+        system_prompt : str
+            System instruction.
+        user_prompt : str
+            User task prompt.
+
+        Returns
+        -------
+        str
+            Raw JSON text from the response.
+
+        Raises
+        ------
+        TranslationError
+            If the provider returns an empty response or request error.
+        """
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.2,
+                response_format={"type": "json_object"},
+                **self._thinking_kwargs(),
+            )
+        except OpenAIError as exc:
+            raise TranslationError(f"LLM request failed: {exc}") from exc
+        content = response.choices[0].message.content
+        if not content:
+            raise TranslationError("LLM response content is empty")
+        return content
+
+    def _thinking_kwargs(self) -> dict[str, Any]:
+        if not self.enable_thinking:
+            return {}
+        return {
+            "reasoning_effort": self.reasoning_effort,
+            "extra_body": {"thinking": {"type": "enabled"}},
+        }
+
+
+@dataclass(frozen=True)
+class AnthropicMessagesClient:
+    """Anthropic messages API adapter."""
+
+    client: Any
+    model: str
+    max_tokens: int = ANTHROPIC_MAX_TOKENS
+
+    async def complete_json(self, system_prompt: str, user_prompt: str) -> str:
+        """
+        Complete a JSON task with Anthropic messages.
+
+        Parameters
+        ----------
+        system_prompt : str
+            System instruction.
+        user_prompt : str
+            User task prompt.
+
+        Returns
+        -------
+        str
+            Raw JSON text from the response.
+
+        Raises
+        ------
+        TranslationError
+            If the provider returns an empty response or request error.
+        """
+        try:
+            response = await self.client.messages.create(
+                model=self.model,
+                max_tokens=self.max_tokens,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+                temperature=0.2,
+            )
+        except AnthropicError as exc:
+            raise TranslationError(f"LLM request failed: {exc}") from exc
+        return _anthropic_response_text(response)
 
 
 @dataclass(frozen=True)
@@ -28,17 +154,14 @@ class OptimizationWindow:
     tokens: list[WordSpan]
 
 
-class OpenAICompatibleTranslator:
-    """Translate and optimize subtitle cues with an OpenAI-compatible client."""
+class LlmTranslator:
+    """Translate and optimize subtitle cues with a JSON completion client."""
 
     def __init__(
         self,
-        client: Any,
-        model: str,
+        completion_client: JsonCompletionClient,
         target_language: str,
         concurrency: int = 4,
-        enable_thinking: bool = True,
-        reasoning_effort: str = "high",
         optimization_retries: int = 3,
         optimization_window_seconds: float = 30.0,
         max_segment_seconds: float = 5.0,
@@ -51,18 +174,12 @@ class OpenAICompatibleTranslator:
 
         Parameters
         ----------
-        client : Any
-            OpenAI-compatible client with ``chat.completions.create``.
-        model : str
-            Chat completion model name.
+        completion_client : JsonCompletionClient
+            Provider adapter that returns JSON text for prompt pairs.
         target_language : str
             Translation target language. Empty means source-only optimization.
         concurrency : int
             Maximum number of concurrent LLM requests.
-        enable_thinking : bool
-            Whether to pass thinking parameters to compatible APIs.
-        reasoning_effort : str
-            Reasoning effort passed to compatible APIs.
         optimization_retries : int
             Maximum optimization attempts per time window.
         optimization_window_seconds : float
@@ -76,12 +193,9 @@ class OpenAICompatibleTranslator:
         pause_seconds : float
             Pause length that allows a short standalone cue.
         """
-        self.client = client
-        self.model = model
+        self.completion_client = completion_client
         self.target_language = target_language
         self.concurrency = max(1, concurrency)
-        self.enable_thinking = enable_thinking
-        self.reasoning_effort = reasoning_effort
         self.optimization_retries = optimization_retries
         self.optimization_window_seconds = optimization_window_seconds
         self.max_segment_seconds = max_segment_seconds
@@ -199,37 +313,80 @@ class OpenAICompatibleTranslator:
                 log_step(f"{operation} retry {attempt}/{retry_count}: {last_error}", icon="🔁")
             system_prompt, user_prompt = build_prompts(last_error)
             try:
-                content = await self._complete_json(system_prompt, user_prompt)
+                content = await self.completion_client.complete_json(system_prompt, user_prompt)
                 return parse(content)
-            except (TranslationError, OpenAIError, asyncio.TimeoutError) as exc:
+            except (TranslationError, asyncio.TimeoutError) as exc:
                 last_error = exc
         if isinstance(last_error, TranslationError):
             raise last_error
         raise TranslationError(f"{operation} failed after {retry_count} attempt(s): {last_error}") from last_error
 
-    async def _complete_json(self, system_prompt: str, user_prompt: str) -> str:
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.2,
-            response_format={"type": "json_object"},
-            **self._thinking_kwargs(),
-        )
-        content = response.choices[0].message.content
-        if not content:
-            raise TranslationError("LLM response content is empty")
-        return content
 
-    def _thinking_kwargs(self) -> dict[str, Any]:
-        if not self.enable_thinking:
-            return {}
-        return {
-            "reasoning_effort": self.reasoning_effort,
-            "extra_body": {"thinking": {"type": "enabled"}},
-        }
+class OpenAICompatibleTranslator(LlmTranslator):
+    """Translate and optimize subtitle cues with an OpenAI-compatible client."""
+
+    def __init__(
+        self,
+        client: Any,
+        model: str,
+        target_language: str,
+        concurrency: int = 4,
+        enable_thinking: bool = True,
+        reasoning_effort: str = "high",
+        optimization_retries: int = 3,
+        optimization_window_seconds: float = 30.0,
+        max_segment_seconds: float = 5.0,
+        max_target_chars: int = 22,
+        min_segment_seconds: float = 2.0,
+        pause_seconds: float = 1.0,
+    ) -> None:
+        """
+        Create an OpenAI-compatible translator.
+
+        Parameters
+        ----------
+        client : Any
+            OpenAI-compatible client with ``chat.completions.create``.
+        model : str
+            Chat completion model name.
+        target_language : str
+            Translation target language. Empty means source-only optimization.
+        concurrency : int
+            Maximum number of concurrent LLM requests.
+        enable_thinking : bool
+            Whether to pass thinking parameters to compatible APIs.
+        reasoning_effort : str
+            Reasoning effort passed to compatible APIs.
+        optimization_retries : int
+            Maximum optimization attempts per time window.
+        optimization_window_seconds : float
+            Maximum seconds of subtitle cues per optimization request.
+        max_segment_seconds : float
+            Maximum duration for each optimized cue.
+        max_target_chars : int
+            Maximum target-language characters for each optimized cue.
+        min_segment_seconds : float
+            Minimum duration for optimized cues unless a pause supports a shorter cue.
+        pause_seconds : float
+            Pause length that allows a short standalone cue.
+        """
+        completion_client = OpenAIChatCompletionClient(
+            client=client,
+            model=model,
+            enable_thinking=enable_thinking,
+            reasoning_effort=reasoning_effort,
+        )
+        super().__init__(
+            completion_client=completion_client,
+            target_language=target_language,
+            concurrency=concurrency,
+            optimization_retries=optimization_retries,
+            optimization_window_seconds=optimization_window_seconds,
+            max_segment_seconds=max_segment_seconds,
+            max_target_chars=max_target_chars,
+            min_segment_seconds=min_segment_seconds,
+            pause_seconds=pause_seconds,
+        )
 
 
 def create_openai_client(api_key: str, base_url: str | None = None) -> AsyncOpenAI:
@@ -251,6 +408,117 @@ def create_openai_client(api_key: str, base_url: str | None = None) -> AsyncOpen
     if base_url:
         return AsyncOpenAI(api_key=api_key, base_url=base_url)
     return AsyncOpenAI(api_key=api_key)
+
+
+def create_anthropic_client(api_key: str, base_url: str | None = None) -> AsyncAnthropic:
+    """
+    Create an Anthropic client.
+
+    Parameters
+    ----------
+    api_key : str
+        API key.
+    base_url : str | None
+        Optional Anthropic-compatible base URL.
+
+    Returns
+    -------
+    AsyncAnthropic
+        Configured Anthropic client.
+    """
+    if base_url:
+        return AsyncAnthropic(api_key=api_key, base_url=base_url)
+    return AsyncAnthropic(api_key=api_key)
+
+
+def create_llm_completion_client(
+    provider: str,
+    api_key: str,
+    base_url: str | None,
+    model: str,
+    enable_thinking: bool = True,
+    reasoning_effort: str = "high",
+) -> JsonCompletionClient:
+    """
+    Create a provider-specific JSON completion adapter.
+
+    Parameters
+    ----------
+    provider : str
+        LLM provider name: ``openai`` or ``anthropic``.
+    api_key : str
+        API key.
+    base_url : str | None
+        Optional provider-compatible base URL.
+    model : str
+        Model name.
+    enable_thinking : bool
+        Whether OpenAI-compatible thinking parameters are enabled.
+    reasoning_effort : str
+        Reasoning effort for OpenAI-compatible APIs.
+
+    Returns
+    -------
+    JsonCompletionClient
+        Provider-neutral completion adapter.
+
+    Raises
+    ------
+    ValueError
+        If the provider is unknown.
+    """
+    normalized_provider = provider.strip().lower()
+    if normalized_provider == "openai":
+        return OpenAIChatCompletionClient(
+            client=create_openai_client(api_key=api_key, base_url=base_url),
+            model=model,
+            enable_thinking=enable_thinking,
+            reasoning_effort=reasoning_effort,
+        )
+    if normalized_provider == "anthropic":
+        return AnthropicMessagesClient(
+            client=create_anthropic_client(api_key=api_key, base_url=base_url),
+            model=model,
+        )
+    raise ValueError("llm.provider must be 'openai' or 'anthropic'")
+
+
+def validate_llm_completion_client(completion_client: JsonCompletionClient) -> None:
+    """
+    Validate that the configured LLM can complete a minimal JSON request.
+
+    Parameters
+    ----------
+    completion_client : JsonCompletionClient
+        Provider-neutral completion adapter.
+
+    Raises
+    ------
+    TranslationError
+        If the request fails or does not return the expected JSON object.
+    """
+    asyncio.run(_validate_llm_completion_client_async(completion_client))
+
+
+async def _validate_llm_completion_client_async(completion_client: JsonCompletionClient) -> None:
+    content = await completion_client.complete_json(LLM_PREFLIGHT_SYSTEM_PROMPT, LLM_PREFLIGHT_USER_PROMPT)
+    try:
+        payload = json.loads(strip_markdown_json(content))
+    except json.JSONDecodeError as exc:
+        raise TranslationError(f"LLM preflight failed: invalid JSON response: {content}") from exc
+    if payload != {"ok": True}:
+        raise TranslationError(f"LLM preflight failed: expected {{'ok': true}}, got {payload}")
+
+
+def _anthropic_response_text(response: Any) -> str:
+    content = "".join(
+        block.text
+        for block in response.content
+        if getattr(block, "type", None) == "text" and getattr(block, "text", "")
+    ).strip()
+    if not content:
+        raise TranslationError("LLM response content is empty")
+    return content
 
 
 def _optimization_windows(

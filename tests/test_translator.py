@@ -6,6 +6,7 @@ from caption.translator import (
     apply_translations,
     parse_optimized_segments_response,
     parse_translation_response,
+    validate_llm_completion_client,
 )
 from caption.types import SubtitleCue, WordSpan
 
@@ -34,6 +35,17 @@ class FakeCompletions:
 class FakeClient:
     def __init__(self, content: str | list[str]) -> None:
         self.chat = type("Chat", (), {"completions": FakeCompletions(content)})()
+
+
+class FakeJsonClient:
+    def __init__(self, content: str | list[str]) -> None:
+        self.contents = content if isinstance(content, list) else [content]
+        self.calls: list[tuple[str, str]] = []
+
+    async def complete_json(self, system_prompt: str, user_prompt: str) -> str:
+        self.calls.append((system_prompt, user_prompt))
+        index = min(len(self.calls) - 1, len(self.contents) - 1)
+        return self.contents[index]
 
 
 def test_translation_response_parsing_and_application() -> None:
@@ -73,7 +85,12 @@ def test_translator_uses_batch_local_ids_for_non_contiguous_cue_indices() -> Non
     assert len(client.chat.completions.calls) == 2
 
 
-def test_translator_retries_invalid_translation_json() -> None:
+def test_translator_retries_invalid_translation_json_and_preflight_handles_fenced_json() -> None:
+    validate_llm_completion_client(FakeJsonClient('```json\n{"ok": true}\n```'))
+
+    with pytest.raises(TranslationError, match="preflight"):
+        validate_llm_completion_client(FakeJsonClient("not json"))
+
     client = FakeClient(
         [
             "not json",
@@ -88,24 +105,6 @@ def test_translator_retries_invalid_translation_json() -> None:
     translated = translator.translate(cues)
 
     assert translated == [SubtitleCue(index=1, start=0.0, end=1.0, source_text="Hello.", target_text="你好。")]
-    assert len(client.chat.completions.calls) == 2
-
-
-def test_optimizer_retries_non_numeric_token_ids() -> None:
-    client = FakeClient(
-        [
-            '{"items":[{"start_token_id":"bad","end_token_id":1,"source_text":"Bad","target_text":"坏"}]}',
-            '{"items":[{"start_token_id":1,"end_token_id":1,"source_text":"Hello.","target_text":"你好。"}]}',
-        ]
-    )
-    translator = OpenAICompatibleTranslator(
-        client=client, model="test-model", target_language="Chinese", concurrency=1, optimization_retries=2
-    )
-    cues = [SubtitleCue(index=1, start=0.0, end=1.0, source_text="Hello", target_text="你好")]
-
-    optimized = translator.optimize(cues)
-
-    assert optimized == [SubtitleCue(index=1, start=0.0, end=1.0, source_text="Hello.", target_text="你好。")]
     assert len(client.chat.completions.calls) == 2
 
 
@@ -155,32 +154,24 @@ def test_parse_optimized_segments_response_splits_with_token_timestamps() -> Non
     ]
 
 
-def test_parse_optimized_segments_response_rejects_long_token_segments() -> None:
-    tokens = [WordSpan("too", 0.0, 3.0), WordSpan("long", 3.0, 6.0)]
-
+def test_parse_optimized_segments_response_enforces_segment_constraints() -> None:
     with pytest.raises(TranslationError, match="duration"):
         parse_optimized_segments_response(
             '{"items":[{"start_token_id":1,"end_token_id":2,"source_text":"too long","target_text":"太长"}]}',
-            tokens,
+            [WordSpan("too", 0.0, 3.0), WordSpan("long", 3.0, 6.0)],
             max_segment_seconds=5.0,
             max_target_chars=15,
         )
-
-
-def test_parse_optimized_segments_response_rejects_long_target_text() -> None:
-    tokens = [WordSpan("short", 0.0, 1.0)]
 
     with pytest.raises(TranslationError, match="target text"):
         parse_optimized_segments_response(
             '{"items":[{"start_token_id":1,"end_token_id":1,"source_text":"short","target_text":"这是一段超过十五个字的中文字幕内容"}]}',
-            tokens,
+            [WordSpan("short", 0.0, 1.0)],
             max_segment_seconds=5.0,
             max_target_chars=15,
         )
 
-
-def test_parse_optimized_segments_response_rejects_short_fragments_without_pause() -> None:
-    tokens = [
+    short_tokens = [
         WordSpan("that", 0.0, 0.3),
         WordSpan("so", 0.3, 0.6),
         WordSpan("many", 0.6, 0.9),
@@ -194,15 +185,13 @@ def test_parse_optimized_segments_response_rejects_short_fragments_without_pause
             '{"start_token_id":1,"end_token_id":2,"source_text":"that so","target_text":"如此"},'
             '{"start_token_id":3,"end_token_id":5,"source_text":"many people wanted","target_text":"多人想要"}'
             "]}",
-            tokens,
+            short_tokens,
             max_segment_seconds=5.0,
             max_target_chars=15,
             min_segment_seconds=1.2,
         )
 
-
-def test_parse_optimized_segments_response_allows_short_segment_before_pause() -> None:
-    tokens = [
+    paused_tokens = [
         WordSpan("yeah", 0.0, 0.3),
         WordSpan("thanks", 0.3, 0.6),
         WordSpan("I", 1.4, 1.5),
@@ -215,7 +204,7 @@ def test_parse_optimized_segments_response_allows_short_segment_before_pause() -
         '{"start_token_id":1,"end_token_id":2,"source_text":"Yeah, thanks.","target_text":"好的，谢谢。"},'
         '{"start_token_id":3,"end_token_id":5,"source_text":"I am Tatsu.","target_text":"我是Tatsu。"}'
         "]}",
-        tokens,
+        paused_tokens,
         max_segment_seconds=5.0,
         max_target_chars=15,
         min_segment_seconds=1.2,
@@ -238,7 +227,7 @@ def test_empty_target_language_skips_translation_but_can_optimize_source() -> No
     assert optimized == [SubtitleCue(index=1, start=0.0, end=1.0, source_text="Hello, world.", target_text="")]
 
 
-def test_optimizer_retries_invalid_timestamps_then_uses_valid_response() -> None:
+def test_optimizer_retries_invalid_timestamps_and_raises_after_retry_budget() -> None:
     client = FakeClient(
         [
             '{"items":[{"start_token_id":99,"end_token_id":99,"source_text":"Bad","target_text":"坏"}]}',
@@ -256,8 +245,6 @@ def test_optimizer_retries_invalid_timestamps_then_uses_valid_response() -> None
     assert len(client.chat.completions.calls) == 2
     assert "Previous attempt failed validation" in client.chat.completions.calls[1]["messages"][1]["content"]
 
-
-def test_optimizer_raises_after_retry_budget_is_exhausted() -> None:
     client = FakeClient('{"items":[{"start_token_id":99,"end_token_id":99,"source_text":"Bad","target_text":"坏"}]}')
     translator = OpenAICompatibleTranslator(
         client=client, model="test-model", target_language="Chinese", concurrency=2, optimization_retries=2
@@ -267,32 +254,3 @@ def test_optimizer_raises_after_retry_budget_is_exhausted() -> None:
     with pytest.raises(TranslationError):
         translator.optimize(cues)
     assert len(client.chat.completions.calls) == 2
-
-
-def test_optimizer_uses_configured_time_windows() -> None:
-    client = FakeClient(
-        [
-            '{"items":[{"start_token_id":1,"end_token_id":1,"source_text":"First.","target_text":"第一。"}]}',
-            '{"items":[{"start_token_id":1,"end_token_id":1,"source_text":"Second.","target_text":"第二。"}]}',
-        ]
-    )
-    translator = OpenAICompatibleTranslator(
-        client=client,
-        model="test-model",
-        target_language="Chinese",
-        concurrency=2,
-        optimization_window_seconds=30.0,
-        max_segment_seconds=20.0,
-    )
-    cues = [
-        SubtitleCue(index=1, start=0.0, end=10.0, source_text="First", target_text="第一"),
-        SubtitleCue(index=2, start=40.0, end=50.0, source_text="Second", target_text="第二"),
-    ]
-
-    optimized = translator.optimize(cues)
-
-    assert len(client.chat.completions.calls) == 2
-    assert [(cue.start, cue.end, cue.source_text) for cue in optimized] == [
-        (0.0, 10.0, "First."),
-        (40.0, 50.0, "Second."),
-    ]

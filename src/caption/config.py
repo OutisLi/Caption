@@ -11,6 +11,7 @@ from caption.asr_mlx import DEFAULT_ALIGNER_MODEL, DEFAULT_ASR_MODEL
 class LlmSettings:
     """LLM API settings."""
 
+    provider: str
     api_key: str
     base_url: str | None
     model: str
@@ -72,6 +73,9 @@ def load_runtime_config(path: Path) -> RuntimeConfig:
 
     api_key = str(llm.get("api_key", "")).strip()
     model = str(llm.get("model", "")).strip()
+    llm_provider = str(llm.get("provider", "openai")).strip().lower()
+    if llm_provider not in {"openai", "anthropic"}:
+        raise ValueError("llm.provider must be 'openai' or 'anthropic'")
     translation_position = str(subtitle.get("translation_position", "bottom"))
     if translation_position not in {"top", "bottom"}:
         raise ValueError("subtitle.translation_position must be 'top' or 'bottom'")
@@ -93,6 +97,7 @@ def load_runtime_config(path: Path) -> RuntimeConfig:
         save_asr_json=bool(output.get("save_asr_json", True)),
         optimize_subtitles=bool(subtitle.get("optimize", True)),
         llm=LlmSettings(
+            provider=llm_provider,
             api_key=api_key,
             base_url=str(llm.get("base_url", "")).strip() or None,
             model=model,

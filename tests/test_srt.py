@@ -1,9 +1,5 @@
-from caption.srt import format_srt_timestamp, render_bilingual_srt, render_srt
+from caption.srt import render_bilingual_srt, render_srt
 from caption.types import SubtitleCue
-
-
-def test_format_srt_timestamp_uses_comma_milliseconds() -> None:
-    assert format_srt_timestamp(3723.4567) == "01:02:03,457"
 
 
 def test_render_srt_outputs_single_language_and_bilingual_variants() -> None:

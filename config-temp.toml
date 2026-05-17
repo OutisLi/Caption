@@ -1,11 +1,12 @@
 [llm]
-api_key = "YOUR_API_KEY"
+concurrency = 5
+optimization_retries = 20
+provider = "openai"  # openai or anthropic
 base_url = "https://api.deepseek.com"
 model = "deepseek-v4-flash"
+api_key = "YOUR_API_KEY"
 enable_thinking = true
 reasoning_effort = "high"
-concurrency = 100
-optimization_retries = 10
 
 [asr]
 model = "models/asr/Qwen3-ASR-1.7B-8bit"

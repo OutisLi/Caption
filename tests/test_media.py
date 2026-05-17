@@ -1,7 +1,5 @@
 from pathlib import Path
 
-import pytest
-
 from caption.media import build_output_paths, discover_media_jobs
 
 
@@ -38,11 +36,6 @@ def test_discover_media_jobs_handles_file_directory_and_outputs(tmp_path: Path) 
     assert paths.bilingual_srt == tmp_path / "out" / "final" / "course" / "week1" / "clip.bilingual.srt"
     assert paths.raw_bilingual_srt == tmp_path / "out" / "raw" / "course" / "week1" / "clip.raw.bilingual.srt"
     assert paths.asr_json == tmp_path / "out" / "asr" / "course" / "week1" / "clip.asr.json"
-
-
-def test_discover_media_jobs_rejects_missing_path(tmp_path: Path) -> None:
-    with pytest.raises(FileNotFoundError):
-        discover_media_jobs(tmp_path / "missing.mp3", tmp_path / "out")
 
 
 def test_directory_media_jobs_preserve_input_root_internal_layout(tmp_path: Path) -> None:

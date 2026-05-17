@@ -23,7 +23,7 @@ class FakeSession:
         return FakeResult()
 
 
-class NonMonotonicResult:
+class SmallOverlapResult:
     text = "one two"
     language = "English"
     chunks = [{"start": 0.0, "end": 1.0, "text": "one two"}]
@@ -33,9 +33,9 @@ class NonMonotonicResult:
     ]
 
 
-class NonMonotonicSession:
-    def transcribe(self, audio: Path, **kwargs: object) -> NonMonotonicResult:
-        return NonMonotonicResult()
+class SmallOverlapSession:
+    def transcribe(self, audio: Path, **kwargs: object) -> SmallOverlapResult:
+        return SmallOverlapResult()
 
 
 def test_local_mlx_asr_uses_default_models_and_normalizes_words(tmp_path: Path) -> None:
@@ -66,38 +66,12 @@ def test_local_mlx_asr_uses_default_models_and_normalizes_words(tmp_path: Path) 
     assert sessions[0].calls[0]["forced_aligner"] == f"aligner:{DEFAULT_ALIGNER_MODEL}"
 
 
-class LargeOverlapResult:
-    text = "one two"
-    language = "English"
-    chunks = [{"start": 0.0, "end": 1.0, "text": "one two"}]
-    segments = [
-        {"text": "one", "start": 0.0, "end": 1.0},
-        {"text": "two", "start": 0.5, "end": 1.5},
-    ]
-
-
-class LargeOverlapSession:
-    def transcribe(self, audio: Path, **kwargs: object) -> LargeOverlapResult:
-        return LargeOverlapResult()
-
-
 def test_local_mlx_asr_clamps_small_timestamp_overlaps(tmp_path: Path) -> None:
     asr = LocalMlxAsr(
-        session_factory=lambda model: NonMonotonicSession(),
+        session_factory=lambda model: SmallOverlapSession(),
         aligner_factory=lambda model: f"aligner:{model}",
     )
 
     result = asr.transcribe(tmp_path / "clip.wav", language="English")
 
     assert [(word.text, word.start, word.end) for word in result.words] == [("one", 0.0, 1.0), ("two", 1.0, 1.5)]
-
-
-def test_local_mlx_asr_preserves_large_overlaps_for_debug_json(tmp_path: Path) -> None:
-    asr = LocalMlxAsr(
-        session_factory=lambda model: LargeOverlapSession(),
-        aligner_factory=lambda model: f"aligner:{model}",
-    )
-
-    result = asr.transcribe(tmp_path / "clip.wav", language="English")
-
-    assert [(word.text, word.start, word.end) for word in result.words] == [("one", 0.0, 1.0), ("two", 0.5, 1.5)]

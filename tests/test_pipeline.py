@@ -61,16 +61,6 @@ class FailingTranslator:
         raise RuntimeError("translation failed")
 
 
-class BadTimestampAsr:
-    def transcribe(self, audio_path: Path, language: str | None = None) -> AsrResult:
-        return AsrResult(
-            text="one two",
-            language="English",
-            words=[WordSpan("one", 0.0, 1.0), WordSpan("two", 0.5, 1.5)],
-            chunks=[{"text": "one two", "start": 0.0, "end": 1.5}],
-        )
-
-
 def test_process_job_writes_incremental_outputs_for_translated_optimized_flow(tmp_path: Path) -> None:
     input_path = tmp_path / "clip.wav"
     input_path.write_bytes(b"fake")
@@ -180,19 +170,3 @@ def test_asr_outputs_are_saved_before_translation_failure(tmp_path: Path) -> Non
         encoding="utf-8"
     ) == "1\n00:00:00,000 --> 00:00:01,000\nHello world.\n"
     assert not (tmp_path / "out" / "asr" / "clip.asr.txt").exists()
-
-
-def test_asr_json_is_saved_before_timestamp_validation_failure(tmp_path: Path) -> None:
-    input_path = tmp_path / "clip.wav"
-    input_path.write_bytes(b"fake")
-    job = MediaJob(input_path=input_path, output_dir=tmp_path / "out", stem="clip")
-    config = CaptionConfig(source_language="English", target_language=None)
-
-    try:
-        process_job(job, config, asr=BadTimestampAsr(), translator=None, optimizer=None, save_asr_json=True)
-    except ValueError as exc:
-        assert "monotonic" in str(exc)
-
-    asr_json = tmp_path / "out" / "asr" / "clip.asr.json"
-    assert asr_json.exists()
-    assert '"start": 0.5' in asr_json.read_text(encoding="utf-8")

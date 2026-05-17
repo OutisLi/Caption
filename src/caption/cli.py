@@ -6,10 +6,16 @@ import sys
 from pathlib import Path
 
 from caption.asr_mlx import LocalMlxAsr
-from caption.config import RuntimeConfig, load_runtime_config
-from caption.types import CaptionConfig
+from caption.config import LlmSettings, RuntimeConfig, load_runtime_config
 from caption.pipeline import run_pipeline
-from caption.translator import OpenAICompatibleTranslator, create_openai_client
+from caption.progress import log_step
+from caption.translator import (
+    LlmTranslator,
+    TranslationError,
+    create_llm_completion_client,
+    validate_llm_completion_client,
+)
+from caption.types import CaptionConfig
 
 CONFIG_PATH = Path("config.toml")
 
@@ -44,14 +50,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def require_llm_settings(config: RuntimeConfig) -> tuple[str, str | None, str]:
+def require_llm_settings(config: RuntimeConfig) -> LlmSettings:
     """
-    Read LLM settings from module constants.
+    Validate required LLM settings.
 
     Returns
     -------
-    tuple[str, str | None, str]
-        API key, base URL, and model name.
+    LlmSettings
+        Validated LLM settings.
 
     Raises
     ------
@@ -62,7 +68,7 @@ def require_llm_settings(config: RuntimeConfig) -> tuple[str, str | None, str]:
         raise ValueError("missing llm.api_key in config.toml")
     if not config.llm.model:
         raise ValueError("missing llm.model in config.toml")
-    return config.llm.api_key, config.llm.base_url, config.llm.model
+    return config.llm
 
 
 def needs_llm(args: argparse.Namespace, config: RuntimeConfig) -> bool:
@@ -120,25 +126,32 @@ def main(argv: list[str] | None = None) -> int:
             plain_text=args.plain_text,
             write_text=args.text,
         )
-        asr = LocalMlxAsr(model=runtime_config.asr_model, aligner_model=runtime_config.aligner_model)
         translator = None
         if needs_llm(args, runtime_config):
-            api_key, base_url, llm_model = require_llm_settings(runtime_config)
-            client = create_openai_client(api_key=api_key, base_url=base_url)
-            translator = OpenAICompatibleTranslator(
-                client=client,
-                model=llm_model,
+            llm = require_llm_settings(runtime_config)
+            completion_client = create_llm_completion_client(
+                provider=llm.provider,
+                api_key=llm.api_key,
+                base_url=llm.base_url,
+                model=llm.model,
+                enable_thinking=llm.enable_thinking,
+                reasoning_effort=llm.reasoning_effort,
+            )
+            log_step(f"LLM preflight started: provider={llm.provider}, model={llm.model}", icon="🔎")
+            validate_llm_completion_client(completion_client)
+            log_step("LLM preflight succeeded", icon="✅")
+            translator = LlmTranslator(
+                completion_client=completion_client,
                 target_language=args.target_lang or "",
-                concurrency=runtime_config.llm.concurrency,
-                enable_thinking=runtime_config.llm.enable_thinking,
-                reasoning_effort=runtime_config.llm.reasoning_effort,
-                optimization_retries=runtime_config.llm.optimization_retries,
+                concurrency=llm.concurrency,
+                optimization_retries=llm.optimization_retries,
                 optimization_window_seconds=runtime_config.optimization_window_seconds,
                 max_segment_seconds=runtime_config.max_optimized_seconds,
                 max_target_chars=runtime_config.max_optimized_target_chars,
                 min_segment_seconds=runtime_config.min_optimized_seconds,
                 pause_seconds=runtime_config.optimization_pause_seconds,
             )
+        asr = LocalMlxAsr(model=runtime_config.asr_model, aligner_model=runtime_config.aligner_model)
         outputs = run_pipeline(
             input_path=args.input_path,
             output_dir=args.output or runtime_config.output_dir,
@@ -148,7 +161,7 @@ def main(argv: list[str] | None = None) -> int:
             optimizer=translator if translator is not None and runtime_config.optimize_subtitles else None,
             save_asr_json=runtime_config.save_asr_json,
         )
-    except (FileNotFoundError, ValueError) as exc:
+    except (FileNotFoundError, ValueError, TranslationError) as exc:
         print(f"caption: {exc}", file=sys.stderr)
         return 1
 

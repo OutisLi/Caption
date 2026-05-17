@@ -1,6 +1,6 @@
 # Caption
 
-轻量级本地 ASR 字幕生成工具。输入视频/音频文件或文件夹，程序会用本地 Qwen3-ASR 识别语音并生成字幕；需要时再调用 OpenAI-compatible LLM 做翻译和字幕分句优化。
+轻量级本地 ASR 字幕生成工具。输入视频/音频文件或文件夹，程序会用本地 Qwen3-ASR 识别语音并生成字幕；需要时再调用 LLM 做翻译和字幕分句优化。
 
 ## 功能
 
@@ -51,6 +51,7 @@ cp config-temp.toml config.toml
 
 ```toml
 [llm]
+provider = "openai"  # openai or anthropic
 api_key = "..."
 base_url = "https://api.deepseek.com"
 model = "deepseek-v4-flash"
