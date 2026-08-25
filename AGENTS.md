@@ -11,9 +11,10 @@ Expected flow:
 3. Persist ASR artifacts immediately under `outputs/asr/`.
 4. Ask an LLM where sentences end in the word stream, then lay each sentence out as display lines.
 5. Optionally extract a transcript glossary and translate sentence by sentence.
-6. Persist pre-review LLM outputs under `outputs/raw/`.
+6. Persist pre-review LLM outputs under `outputs/srt/raw/`.
 7. Optionally refine translations through bounded score-and-revise rounds.
-8. Write final SRT and TXT outputs under `outputs/final/`.
+8. Write final SRT and TXT outputs under `outputs/srt/final/`.
+9. Optionally mux the finished subtitle tracks into an MKV under `outputs/mkv/`.
 
 ## Core Design Constraint
 
@@ -81,7 +82,7 @@ Sampling is split into `[llm.thinking]` and `[llm.instruct]` because models publ
 
 `[subtitle]` describes how subtitles are produced: segmentation mode, target language, display limits, and the review loop. Nothing else. Batch sizes and translation context width are tuning constants in the module that owns them, not configuration; a value a user cannot reason about is not a setting.
 
-`[asr]` holds model paths and the model cache directory. `[output]` holds the output directory and ASR JSON persistence.
+`[asr]` holds model paths and the model cache directory. `[output]` holds the output directory, ASR JSON persistence, and whether to embed the finished subtitles into an MKV.
 
 Keep these as CLI flags:
 
@@ -97,6 +98,7 @@ Capability switches are layered and each is independently expressible:
 - `subtitle.segmentation = "llm"` restores sentences with the LLM. This is the prerequisite for translation.
 - `subtitle.target_lang` sets the default target language (`zh` when unset); `--target-lang` overrides it per run, and an empty string in either place disables translation.
 - `subtitle.review_rounds = 0` disables the review loop. There is no separate boolean switch.
+- `output.embed = false` skips the MKV mux. When embedding a translated job, the MKV carries source, target, and bilingual tracks; bilingual is the default.
 
 Do not add low-frequency runtime knobs to the CLI unless explicitly requested.
 
@@ -105,6 +107,7 @@ Do not add low-frequency runtime knobs to the CLI unless explicitly requested.
 - `src/caption/cli.py`: argument parsing and object wiring only.
 - `src/caption/config.py`: TOML config loading and validation.
 - `src/caption/media.py`: media discovery and output path derivation only.
+- `src/caption/language.py`: language labels for filenames and Matroska tags. No I/O.
 - `src/caption/asr_mlx.py`: MLX Qwen3-ASR adapter only.
 - `src/caption/pipeline.py`: stage orchestration and incremental file writes. ASR (producer thread) overlaps the LLM stage (consumer) across files whenever an LLM stage is active.
 - `src/caption/llm_client.py`: provider adapters, the retrying JSON task helper, and preflight. No subtitle logic.
@@ -116,6 +119,7 @@ Do not add low-frequency runtime knobs to the CLI unless explicitly requested.
 - `src/caption/progress.py`: tqdm progress bars and concise stage logging only.
 - `src/caption/segment.py`: deterministic cue construction, both the ASR-only path and sentence layout.
 - `src/caption/srt.py`: SRT rendering only.
+- `src/caption/mux.py`: ffmpeg mux of finished subtitle tracks into an MKV. No subtitle logic.
 - `src/caption/types.py`: dataclasses and shared types.
 
 Keep files focused. Do not create large multi-purpose modules.
@@ -134,7 +138,8 @@ Keep files focused. Do not create large multi-purpose modules.
 - If a stage succeeds, persist its output before starting the next stage.
 - When the LLM stage is active, ASR for the next file runs concurrently with the current file's LLM work; ASR artifacts must be persisted before a job enters the LLM stage. Without an LLM stage, files are processed sequentially.
 - When `asr/*.asr.json` already exists for a media file, reuse it and skip ASR. Invalid cache files must raise an error instead of triggering re-transcription.
-- Keep output layout centralized in `src/caption/media.py`: ASR artifacts under `asr/`, pre-review LLM artifacts under `raw/`, final artifacts under `final/`.
+- When the finished `srt/final/` SRTs for a job already exist, reuse them and skip segmentation, translation, and review. A partial or empty set must raise instead of mixing old and new files.
+- Keep output layout centralized in `src/caption/media.py`: ASR artifacts under `asr/`, pre-review LLM artifacts under `srt/raw/`, final subtitles under `srt/final/`, muxed MKVs under `mkv/`.
 - For folder inputs, preserve only the input root's internal relative layout. Never include parent directories before the user-provided input root.
 - Write TXT sidecar files only when `--text` is set, except `--plain-text`, which always writes ASR SRT and TXT.
 - Use tqdm for countable long-running stages; use concise logs only for stage boundaries.
@@ -153,12 +158,15 @@ Tests should be scenario-level, not tiny one-assertion noise. Add focused unit t
 - Reported boundaries cover the batch exactly once, and unusable ids degrade instead of failing.
 - Line layout honours whichever display limit binds, never asks for more lines than there is text to fill, and reassembles into the original sentence.
 - ASR result persistence before LLM work, including chunk-based `asr/*.asr.txt` when TXT output is enabled.
-- Raw outputs retained under `raw/` before review, and review output winning in `final/`.
-- Final outputs written under `final/`, with folder input relative layout preserved.
+- Raw outputs retained under `srt/raw/` before review, and review output winning in `srt/final/`.
+- Final outputs written under `srt/final/`, with folder input relative layout preserved.
+- Finished `srt/final/` SRTs are reused and skip the LLM stage; an incomplete set raises.
+- Final monolingual SRTs use a language suffix; the bilingual file is unsuffixed.
 - `--text` controls TXT outputs outside plain-text mode.
 - LLM JSON validation and retry behavior, including the bounded review loop.
 - Per-stage reasoning selection.
 - CLI/config boundaries, including the capability layering.
+- MKV embed writes source, target, and bilingual tracks, with bilingual as the default.
 - Progress-sensitive long-running flow behavior.
 
 ## Demo Command
@@ -169,4 +177,4 @@ Use a short sample when validating behavior:
 caption examples/test_5min.mp4
 ```
 
-Expected outputs go to `outputs/asr/`, `outputs/raw/`, and `outputs/final/`.
+Expected outputs go to `outputs/asr/`, `outputs/srt/raw/`, `outputs/srt/final/`, and `outputs/mkv/`.

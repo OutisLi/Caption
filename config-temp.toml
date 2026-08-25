@@ -44,6 +44,9 @@ model_cache_dir = "models/asr"
 [output]
 dir = "outputs"
 save_asr_json = true
+# Copy video/audio into an MKV and attach the finished subtitle tracks.
+# Translation writes source, target, and bilingual; bilingual is the default track.
+embed = true
 
 [subtitle]
 # How the transcript is divided into subtitles.

@@ -9,6 +9,7 @@ from caption.asr_mlx import LocalMlxAsr
 from caption.config import LlmSettings, RuntimeConfig, load_runtime_config
 from caption.llm_client import create_llm_completion_client, validate_llm_completion_client
 from caption.llm_json import TranslationError
+from caption.mux import MuxError
 from caption.pipeline import run_pipeline
 from caption.progress import log_step
 from caption.translator import LlmTranslator
@@ -130,6 +131,7 @@ def main(argv: list[str] | None = None) -> int:
             plain_text=args.plain_text,
             write_text=args.text,
             review=subtitle.review_rounds > 0,
+            embed=runtime_config.embed,
         )
         translator = None
         if needs_llm(args, target_lang, subtitle.segmentation):
@@ -167,7 +169,7 @@ def main(argv: list[str] | None = None) -> int:
             translator=translator,
             save_asr_json=runtime_config.save_asr_json,
         )
-    except (FileNotFoundError, ValueError, TranslationError) as exc:
+    except (FileNotFoundError, ValueError, TranslationError, MuxError) as exc:
         print(f"caption: {exc}", file=sys.stderr)
         return 1
 

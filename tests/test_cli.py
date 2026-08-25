@@ -70,6 +70,7 @@ def test_an_empty_config_resolves_entirely_from_the_packaged_defaults(tmp_path: 
     assert config.model_cache_dir is None
     assert config.output_dir == cli.Path("outputs")
     assert config.save_asr_json is True
+    assert config.embed is True
     assert config.llm.provider == "openai"
     assert config.llm.base_url is None
     assert config.llm.concurrency == 4
@@ -178,6 +179,7 @@ dir = "outputs"
                 target_srt=tmp_path / "outputs" / "clip.target.srt",
                 target_txt=tmp_path / "outputs" / "clip.target.txt",
                 bilingual_srt=tmp_path / "outputs" / "clip.bilingual.srt",
+                mkv=tmp_path / "outputs" / "clip.mkv",
                 written_paths=(written_path,),
             )
         ]
@@ -244,6 +246,7 @@ review_rounds = 0
         assert config.write_text is True
         assert config.plain_text is False
         assert config.review is False
+        assert config.embed is True
         return []
 
     monkeypatch.chdir(tmp_path)
@@ -253,6 +256,43 @@ review_rounds = 0
     monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
 
     assert cli.main([str(input_path), "--target-lang", "zh", "--text"]) == 0
+
+
+def test_cli_disables_mkv_embed_from_output_config(
+    tmp_path: cli.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "config.toml").write_text(
+        """
+[llm]
+api_key = "key"
+model = "model"
+
+[output]
+embed = false
+""",
+        encoding="utf-8",
+    )
+    input_path = tmp_path / "clip.wav"
+    input_path.write_bytes(b"fake")
+    seen: list[bool] = []
+
+    def fake_run_pipeline(
+        input_path: cli.Path,
+        output_dir: cli.Path,
+        config: CaptionConfig,
+        **kwargs: object,
+    ) -> list[OutputPaths]:
+        seen.append(config.embed)
+        return []
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "LocalMlxAsr", lambda **kwargs: object())
+    monkeypatch.setattr(cli, "create_llm_completion_client", lambda **kwargs: object())
+    monkeypatch.setattr(cli, "validate_llm_completion_client", lambda client: None)
+    monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
+
+    assert cli.main([str(input_path), "--target-lang", ""]) == 0
+    assert seen == [False]
 
 
 def test_asr_segmentation_never_reaches_the_llm(tmp_path: cli.Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -46,6 +46,7 @@ aligner_model = "mlx-community/Qwen3-ForcedAligner-0.6B-8bit"
 [output]
 dir = "outputs"
 save_asr_json = true
+embed = true
 
 [subtitle]
 segmentation = "llm"

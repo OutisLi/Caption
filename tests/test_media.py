@@ -28,13 +28,21 @@ def test_discover_media_jobs_handles_file_directory_and_outputs(tmp_path: Path) 
     assert [job.stem for job in jobs] == ["a", "clip", "b"]
     assert [job.relative_output_dir for job in jobs] == [Path(), Path(), Path("nested")]
 
-    paths = build_output_paths(tmp_path / "out", Path("course/week1"), "clip", save_asr_json=True)
+    paths = build_output_paths(
+        tmp_path / "out",
+        Path("course/week1"),
+        "clip",
+        save_asr_json=True,
+        source_lang="English",
+        target_lang="zh",
+    )
 
     assert paths.asr_srt == tmp_path / "out" / "asr" / "course" / "week1" / "clip.asr.srt"
-    assert paths.source_srt == tmp_path / "out" / "final" / "course" / "week1" / "clip.source.srt"
-    assert paths.target_srt == tmp_path / "out" / "final" / "course" / "week1" / "clip.target.srt"
-    assert paths.bilingual_srt == tmp_path / "out" / "final" / "course" / "week1" / "clip.bilingual.srt"
-    assert paths.raw_bilingual_srt == tmp_path / "out" / "raw" / "course" / "week1" / "clip.raw.bilingual.srt"
+    assert paths.source_srt == tmp_path / "out" / "srt" / "final" / "course" / "week1" / "clip_en.srt"
+    assert paths.target_srt == tmp_path / "out" / "srt" / "final" / "course" / "week1" / "clip_zh.srt"
+    assert paths.bilingual_srt == tmp_path / "out" / "srt" / "final" / "course" / "week1" / "clip.srt"
+    assert paths.mkv == tmp_path / "out" / "mkv" / "course" / "week1" / "clip.mkv"
+    assert paths.raw_bilingual_srt == tmp_path / "out" / "srt" / "raw" / "course" / "week1" / "clip.raw.bilingual.srt"
     assert paths.asr_json == tmp_path / "out" / "asr" / "course" / "week1" / "clip.asr.json"
 
 

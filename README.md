@@ -13,6 +13,7 @@
 - 译文可经过打分与定向重译的精修循环，轮数有上限。
 - ASR 完成后立即写出中间结果，后续 LLM 失败时不会丢掉识别结果。
 - 处理文件夹时保留输入文件夹内部的相对层级。
+- 默认把完成的字幕嵌入源媒体，写成带语言标签的 MKV；翻译时挂原文、译文、双语三轨，双语为默认轨。
 
 ## 设计
 
@@ -110,6 +111,7 @@ model_cache_dir = "models/asr"
 [output]
 dir = "outputs"
 save_asr_json = true
+embed = true
 
 [subtitle]
 segmentation = "llm"  # "llm" 由模型断句，"asr" 只按显示上限机械切分
@@ -129,6 +131,7 @@ review_pass_score = 4
 | `segmentation = "llm"`，`target_lang = ""` | 按句子断开、带标点的原文字幕 |
 | 再设 `target_lang = "zh"` | 双语字幕 |
 | 再设 `review_rounds > 0` | 经过打分与重译精修的译文 |
+| `output.embed = true`（默认） | `mkv/` 下的 MKV，翻译时挂原文、译文、双语三轨，双语为默认轨 |
 
 `max_chars_per_cue` 按源语言计算，和 `max_seconds_per_cue` 一起决定每句切成几行；译文按各行的信息量对齐，不单独设字数。批次大小、翻译上下文宽度等实现细节不开放为配置项，它们是源码中的常量。
 
@@ -178,19 +181,19 @@ caption /path/to/media_folder
 
 ## 输出
 
-输出目录默认为 `outputs/`，按阶段分为 `asr/`、`raw/`、`final/`。默认只写 JSON 和 SRT；传入 `--text` 时才写 TXT。`--plain-text` 模式始终写 ASR 的 SRT 和 TXT。
+输出目录默认为 `outputs/`，按阶段分为 `asr/`、`srt/raw/`、`srt/final/`、`mkv/`。默认只写 JSON 和 SRT；传入 `--text` 时才写 TXT。`--plain-text` 模式始终写 ASR 的 SRT 和 TXT。
 
 - `asr/<relative>/<name>.asr.json`：ASR 原始结构化结果。
 - `asr/<relative>/<name>.asr.srt`：ASR 阶段直接生成的源语言字幕。
 - `asr/<relative>/<name>.asr.txt`：ASR 阶段的源语言纯文本，仅 `--text` 或 `--plain-text` 时生成。
-- `raw/<relative>/<name>.raw.source.srt`：精修前的源语言字幕，仅 `review_rounds > 0` 时生成。
-- `raw/<relative>/<name>.raw.target.srt`、`raw/<relative>/<name>.raw.bilingual.srt`：精修前的翻译字幕。
-- `final/<relative>/<name>.source.srt`：最终源语言字幕。
-- `final/<relative>/<name>.target.srt`：最终目标语言字幕。默认目标语言是 `zh`；目标语言为空（config 或 `--target-lang ""`）时不生成。
-- `final/<relative>/<name>.bilingual.srt`：最终双语字幕。
-- `raw/<relative>/*.txt`、`final/<relative>/*.txt`：对应阶段的纯文本文件，仅 `--text` 时生成。
+- `srt/raw/<relative>/<name>.raw.source.srt`：精修前的源语言字幕，仅 `review_rounds > 0` 时生成。
+- `srt/raw/<relative>/<name>.raw.target.srt`、`srt/raw/<relative>/<name>.raw.bilingual.srt`：精修前的翻译字幕。
+- `srt/final/<relative>/<name>_<lang>.srt`：单语字幕，后缀为源语言或目标语言代码，例如 `_en`、`_zh`。
+- `srt/final/<relative>/<name>.srt`：双语字幕，无语言后缀。目标语言为空时不生成译文和双语文件。
+- `mkv/<relative>/<name>.mkv`：源媒体加上嵌入字幕。翻译时含原文、译文、双语三轨，双语为默认轨；语言标签按源语言和 `target_lang` 写入。`output.embed = false` 时不生成。
+- `srt/raw/<relative>/*.txt`、`srt/final/<relative>/*.txt`：对应阶段的纯文本文件，仅 `--text` 时生成。
 
-如果输入是单个文件，`<relative>` 为空；如果输入是文件夹，`<relative>` 是该输入文件夹内部的相对路径，不包含输入文件夹自身或它之前的父路径。例如输入 `/data/media`，其中有 `course/week1/clip.mp4`，最终双语字幕会写到 `outputs/final/course/week1/clip.bilingual.srt`。
+如果输入是单个文件，`<relative>` 为空；如果输入是文件夹，`<relative>` 是该输入文件夹内部的相对路径，不包含输入文件夹自身或它之前的父路径。例如输入 `/data/media`，其中有 `course/week1/clip.mp4`，最终双语字幕会写到 `outputs/srt/final/course/week1/clip.srt`。
 
 ## 工作流
 
@@ -198,10 +201,12 @@ caption /path/to/media_folder
 2. 如果 `asr/<relative>/<name>.asr.json` 已存在，直接复用该缓存并跳过语音识别；否则本地 Qwen3-ASR 识别音频。
 3. ASR 完成后立即写出 `asr/*.asr.json` 和 `asr/*.asr.srt`，传入 `--text` 或 `--plain-text` 时同时写出 `asr/*.asr.txt`。
 4. 如果传入 `--plain-text`，流程到此结束。
-5. LLM 报告词流中的句子边界，程序按显示上限把每个句子排版成显示行。`segmentation = "asr"` 时跳过这一步，直接机械切分。
-6. 目标语言非空时，抽取术语表并逐句翻译，然后保存 `raw/` 字幕。
-7. `review_rounds > 0` 时对译文批量打分，只重译被判定不合格的句子，达到轮数上限或全部通过即停止。
-8. 写出 `final/` SRT；传入 `--text` 时同时写出 TXT。
+5. 如果 `srt/final/` 里已有该次运行需要的成品字幕，直接复用并跳过 LLM；缺一份或文件为空则报错，不会重跑翻译。
+6. 否则由 LLM 报告词流中的句子边界，程序按显示上限把每个句子排版成显示行。`segmentation = "asr"` 时跳过这一步，直接机械切分。
+7. 目标语言非空时，抽取术语表并逐句翻译，然后保存 `srt/raw/` 字幕。
+8. `review_rounds > 0` 时对译文批量打分，只重译被判定不合格的句子，达到轮数上限或全部通过即停止。
+9. 写出 `srt/final/` SRT；传入 `--text` 时同时写出 TXT。
+10. `output.embed` 为真时，把完成的字幕轨 mux 进源媒体，写成 `mkv/<relative>/<name>.mkv`。
 
 运行时会用 `tqdm` 显示 ASR chunk、断句 batch、逐句翻译、打分 batch、重译等可计数进度；阶段性事件会用简短日志打印。处理多个文件且启用 LLM 阶段时，下一个文件的语音识别会与当前文件的 LLM 阶段并行执行，ASR 结果落盘后才进入 LLM 阶段。
 

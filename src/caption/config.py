@@ -56,6 +56,7 @@ class RuntimeConfig:
     aligner_model: str
     model_cache_dir: Path | None
     save_asr_json: bool
+    embed: bool
     llm: LlmSettings
     subtitle: SubtitleSettings
 
@@ -112,6 +113,7 @@ def load_runtime_config(path: Path) -> RuntimeConfig:
         aligner_model=str(asr["aligner_model"]).strip(),
         model_cache_dir=Path(model_cache_dir) if model_cache_dir else None,
         save_asr_json=bool(output["save_asr_json"]),
+        embed=bool(output["embed"]),
         llm=LlmSettings(
             provider=llm_provider,
             api_key=str(llm.get("api_key", "")).strip(),

@@ -8,7 +8,9 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Protocol
 
+from caption.language import Language, resolve_language
 from caption.media import build_output_paths, discover_media_jobs
+from caption.mux import SubtitleTrack, mux_subtitles
 from caption.progress import log_step
 from caption.segment import build_cues, build_cues_from_layouts
 from caption.srt import render_bilingual_srt, render_srt
@@ -176,9 +178,9 @@ def _run_overlapped(
                 if stop.is_set():
                     break
                 log_step(f"Processing file {index}/{len(jobs)}: {job.input_path}", icon="📄")
-                paths = build_output_paths(job.output_dir, job.relative_output_dir, job.stem, save_asr_json)
+                paths = _job_output_paths(job, config, save_asr_json)
                 asr_result, written_paths = _run_asr_stage(job, config, asr, paths)
-                work_queue.put((paths, asr_result, written_paths))
+                work_queue.put((job, paths, asr_result, written_paths))
         except Exception as exc:
             work_queue.put(exc)
         finally:
@@ -195,8 +197,8 @@ def _run_overlapped(
                 break
             if isinstance(item, Exception):
                 raise item
-            paths, asr_result, written_paths = item  # type: ignore[misc]
-            outputs.append(_run_llm_stage(config, translator, paths, asr_result, written_paths))
+            job, paths, asr_result, written_paths = item  # type: ignore[misc]
+            outputs.append(_run_llm_stage(job, config, translator, paths, asr_result, written_paths))
     except Exception:
         stop.set()
         producer.join()
@@ -237,10 +239,12 @@ def process_job(
     ------
     ValueError
         If ASR returns no timestamped words.
+    MuxError
+        If subtitle embedding is enabled and muxing fails.
     """
-    paths = build_output_paths(job.output_dir, job.relative_output_dir, job.stem, save_asr_json)
+    paths = _job_output_paths(job, config, save_asr_json)
     asr_result, written_paths = _run_asr_stage(job, config, asr, paths)
-    return _run_llm_stage(config, translator, paths, asr_result, written_paths)
+    return _run_llm_stage(job, config, translator, paths, asr_result, written_paths)
 
 
 def _run_asr_stage(
@@ -287,6 +291,7 @@ def _run_asr_stage(
 
 
 def _run_llm_stage(
+    job: MediaJob,
     config: CaptionConfig,
     translator: Translator | None,
     paths: OutputPaths,
@@ -298,6 +303,8 @@ def _run_llm_stage(
 
     Parameters
     ----------
+    job : MediaJob
+        Media job. The input path is required when embedding an MKV.
     config : CaptionConfig
         Caption generation configuration.
     translator : Translator | None
@@ -317,40 +324,144 @@ def _run_llm_stage(
     Raises
     ------
     ValueError
-        If translation is requested without a translator.
+        If translation is requested without a translator, or a subtitle cache is incomplete.
+    MuxError
+        If subtitle embedding is enabled and muxing fails.
     """
+    paths = _job_output_paths(job, config, paths.asr_json is not None, asr_result)
     if config.plain_text:
         log_step("Plain-text mode enabled; skipped LLM steps", icon="⏭️")
-        return replace(paths, written_paths=tuple(written_paths))
-
-    if translator is None:
+    elif _reuse_final_subtitles(config, paths):
+        log_step(f"Subtitle cache reused: {_cache_label(config, paths)}", icon="♻️")
+    elif translator is None:
         if config.target_language:
             raise ValueError("translator is required when target_language is set")
         cues = build_cues(asr_result.words, config.max_chars_per_cue, config.max_seconds_per_cue)
         written_paths.extend(_write_final_outputs(config, paths, cues))
         log_step(f"Final source output saved: {paths.source_srt}", icon="✅")
-        return replace(paths, written_paths=tuple(written_paths))
-
-    if not config.target_language:
+    elif not config.target_language:
         log_step("Sentence segmentation started", icon="✂️")
         cues = build_cues_from_layouts(translator.segment(asr_result.words))
         written_paths.extend(_write_final_outputs(config, paths, cues))
         log_step(f"Final source output saved: {paths.source_srt}", icon="✅")
-        return replace(paths, written_paths=tuple(written_paths))
+    else:
+        log_step(f"Translation started: target={config.target_language}", icon="🌐")
+        draft = translator.translate(asr_result.words)
+        sentences: Sequence[SentenceLayout] = draft.sentences
+        if config.review:
+            written_paths.extend(_write_raw_outputs(config, paths, build_cues_from_layouts(sentences)))
+            log_step(f"Raw translated outputs saved: {paths.raw_bilingual_srt}", icon="💾")
+            log_step("LLM subtitle review started", icon="🧠")
+            sentences = translator.review(draft)
+            log_step("LLM subtitle review completed", icon="✅")
 
-    log_step(f"Translation started: target={config.target_language}", icon="🌐")
-    draft = translator.translate(asr_result.words)
-    sentences: Sequence[SentenceLayout] = draft.sentences
-    if config.review:
-        written_paths.extend(_write_raw_outputs(config, paths, build_cues_from_layouts(sentences)))
-        log_step(f"Raw translated outputs saved: {paths.raw_bilingual_srt}", icon="💾")
-        log_step("LLM subtitle review started", icon="🧠")
-        sentences = translator.review(draft)
-        log_step("LLM subtitle review completed", icon="✅")
+        written_paths.extend(_write_final_outputs(config, paths, build_cues_from_layouts(sentences)))
+        log_step(f"Final bilingual output saved: {paths.bilingual_srt}", icon="✅")
 
-    written_paths.extend(_write_final_outputs(config, paths, build_cues_from_layouts(sentences)))
-    log_step(f"Final bilingual output saved: {paths.bilingual_srt}", icon="✅")
+    if config.embed:
+        written_paths.append(_embed_mkv(job, config, paths, asr_result))
     return replace(paths, written_paths=tuple(written_paths))
+
+
+def _embed_mkv(job: MediaJob, config: CaptionConfig, paths: OutputPaths, asr_result: AsrResult) -> Path:
+    """Mux finished subtitle tracks into an MKV of the source media."""
+    tracks = _subtitle_tracks(config, paths, asr_result)
+    log_step(f"MKV mux started: {paths.mkv}", icon="🎬")
+    mux_subtitles(job.input_path, paths.mkv, tracks)
+    log_step(f"MKV mux completed: {paths.mkv}", icon="✅")
+    return paths.mkv
+
+
+def _subtitle_tracks(config: CaptionConfig, paths: OutputPaths, asr_result: AsrResult) -> list[SubtitleTrack]:
+    """
+    Choose which SRT files to embed and how players should label them.
+
+    A translated job carries three tracks: source, target, and bilingual. The
+    bilingual track is the default. Source-only jobs embed a single track.
+    """
+    source = _source_language(config, asr_result)
+    if config.plain_text:
+        return [SubtitleTrack(paths.asr_srt, source.tag, source.title, default=True)]
+    if not config.target_language:
+        return [SubtitleTrack(paths.source_srt, source.tag, source.title, default=True)]
+    target = resolve_language(config.target_language)
+    return [
+        SubtitleTrack(paths.source_srt, source.tag, source.title, default=False),
+        SubtitleTrack(paths.target_srt, target.tag, target.title, default=False),
+        SubtitleTrack(paths.bilingual_srt, "mul", "Bilingual", default=True),
+    ]
+
+
+def _expected_final_srts(config: CaptionConfig, paths: OutputPaths) -> tuple[Path, ...]:
+    """Return the final SRT files that constitute a reusable subtitle cache."""
+    if config.plain_text:
+        return ()
+    if config.target_language:
+        return (paths.source_srt, paths.target_srt, paths.bilingual_srt)
+    return (paths.source_srt,)
+
+
+def _reuse_final_subtitles(config: CaptionConfig, paths: OutputPaths) -> bool:
+    """
+    Reuse finished final SRTs when the complete set is already on disk.
+
+    Missing files mean there is no cache. A partial or empty set is invalid and
+    must fail, matching the ASR JSON cache: never continue as if the work is done,
+    and never start a translation that would mix old and new files.
+
+    Returns
+    -------
+    bool
+        True when the expected final SRTs exist and can be reused.
+
+    Raises
+    ------
+    ValueError
+        If some but not all expected files exist, or a file is empty.
+    """
+    expected = _expected_final_srts(config, paths)
+    if not expected:
+        return False
+    existing = tuple(path for path in expected if path.exists())
+    if not existing:
+        return False
+    missing = [path for path in expected if not path.exists()]
+    if missing:
+        raise ValueError(f"incomplete subtitle cache under {expected[0].parent}: missing {missing[0].name}")
+    for path in expected:
+        if not path.read_text(encoding="utf-8").strip():
+            raise ValueError(f"invalid subtitle cache file {path}: empty")
+    return True
+
+
+def _cache_label(config: CaptionConfig, paths: OutputPaths) -> Path:
+    """Return the cache path to mention in logs."""
+    return paths.bilingual_srt if config.target_language else paths.source_srt
+
+
+def _job_output_paths(
+    job: MediaJob,
+    config: CaptionConfig,
+    save_asr_json: bool,
+    asr_result: AsrResult | None = None,
+) -> OutputPaths:
+    """Build output paths, using the ASR language once it is known."""
+    source_lang = config.source_language or ""
+    if asr_result is not None:
+        source_lang = source_lang or asr_result.language
+    return build_output_paths(
+        job.output_dir,
+        job.relative_output_dir,
+        job.stem,
+        save_asr_json,
+        source_lang=source_lang,
+        target_lang=config.target_language or "",
+    )
+
+
+def _source_language(config: CaptionConfig, asr_result: AsrResult) -> Language:
+    """Prefer the forced source language, then the ASR report, then undefined."""
+    return resolve_language(config.source_language or asr_result.language or "und")
 
 
 def _write_raw_outputs(config: CaptionConfig, paths: OutputPaths, cues: list[SubtitleCue]) -> list[Path]:

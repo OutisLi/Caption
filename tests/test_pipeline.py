@@ -3,6 +3,7 @@ import threading
 
 import pytest
 
+from caption.mux import SubtitleTrack
 from caption.pipeline import process_job, run_pipeline
 from caption.translator import TranslationDraft
 from caption.types import (
@@ -121,8 +122,10 @@ def test_process_job_writes_draft_before_review_and_review_wins(tmp_path: Path) 
     assert paths.asr_json is not None
     assert '"text": "Hello world."' in paths.asr_json.read_text(encoding="utf-8")
     assert paths.asr_srt == tmp_path / "out" / "asr" / "course" / "week1" / "clip.asr.srt"
-    assert paths.raw_bilingual_srt == tmp_path / "out" / "raw" / "course" / "week1" / "clip.raw.bilingual.srt"
-    assert paths.bilingual_srt == tmp_path / "out" / "final" / "course" / "week1" / "clip.bilingual.srt"
+    assert paths.raw_bilingual_srt == tmp_path / "out" / "srt" / "raw" / "course" / "week1" / "clip.raw.bilingual.srt"
+    assert paths.source_srt == tmp_path / "out" / "srt" / "final" / "course" / "week1" / "clip_en.srt"
+    assert paths.target_srt == tmp_path / "out" / "srt" / "final" / "course" / "week1" / "clip_zh.srt"
+    assert paths.bilingual_srt == tmp_path / "out" / "srt" / "final" / "course" / "week1" / "clip.srt"
 
 
 def test_process_job_without_review_publishes_the_draft(tmp_path: Path) -> None:
@@ -202,7 +205,7 @@ def test_plain_text_mode_stops_after_asr_outputs(tmp_path: Path) -> None:
         input_path=input_path, output_dir=tmp_path / "out", relative_output_dir=Path("course/week1"), stem="clip"
     )
     config = CaptionConfig(source_language="English", target_language=None, plain_text=True)
-    stale_bilingual = job.output_dir / "final" / "course" / "week1" / "clip.bilingual.srt"
+    stale_bilingual = job.output_dir / "srt" / "final" / "course" / "week1" / "clip.srt"
     stale_bilingual.parent.mkdir(parents=True)
     stale_bilingual.write_text("old", encoding="utf-8")
 
@@ -249,12 +252,57 @@ def test_process_job_reuses_cached_asr_json(tmp_path: Path) -> None:
     first = process_job(job, config, asr=FakeAsr(), translator=FakeTranslator(), save_asr_json=True)
     assert first.asr_json is not None and first.asr_json.exists()
 
-    paths = process_job(job, config, asr=ExplodingAsr(), translator=FakeTranslator(), save_asr_json=True)
+    paths = process_job(job, config, asr=ExplodingAsr(), translator=FailingTranslator(), save_asr_json=True)
 
     assert paths.asr_json is not None
     assert paths.asr_json not in paths.written_paths
+    assert paths.source_srt not in paths.written_paths
     assert paths.source_srt.read_text(encoding="utf-8") == "1\n00:00:00,000 --> 00:00:01,000\nHello, world.\n"
     assert paths.target_srt.read_text(encoding="utf-8") == "1\n00:00:00,000 --> 00:00:01,000\n你好，世界。\n"
+    assert paths.bilingual_srt.read_text(encoding="utf-8") == first.bilingual_srt.read_text(encoding="utf-8")
+
+
+def test_process_job_reuses_source_only_final_subtitles(tmp_path: Path) -> None:
+    input_path = tmp_path / "clip.wav"
+    input_path.write_bytes(b"fake")
+    job = MediaJob(input_path=input_path, output_dir=tmp_path / "out", stem="clip")
+    config = CaptionConfig(source_language="English", target_language=None)
+
+    first = process_job(job, config, asr=FakeAsr(), translator=FakeTranslator(), save_asr_json=False)
+    paths = process_job(job, config, asr=FakeAsr(), translator=FailingTranslator(), save_asr_json=False)
+
+    assert paths.source_srt == first.source_srt
+    assert paths.source_srt not in paths.written_paths
+    assert paths.source_srt.read_text(encoding="utf-8") == "1\n00:00:00,000 --> 00:00:01,000\nHello world.\n"
+    assert not paths.target_srt.exists()
+
+
+def test_process_job_rejects_incomplete_final_subtitle_cache(tmp_path: Path) -> None:
+    input_path = tmp_path / "clip.wav"
+    input_path.write_bytes(b"fake")
+    job = MediaJob(input_path=input_path, output_dir=tmp_path / "out", stem="clip")
+    config = CaptionConfig(source_language="English", target_language="zh")
+    bilingual = tmp_path / "out" / "srt" / "final" / "clip.srt"
+    bilingual.parent.mkdir(parents=True)
+    bilingual.write_text("1\n00:00:00,000 --> 00:00:01,000\nstale\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="incomplete subtitle cache"):
+        process_job(job, config, asr=FakeAsr(), translator=FailingTranslator(), save_asr_json=False)
+
+
+def test_process_job_rejects_empty_final_subtitle_cache(tmp_path: Path) -> None:
+    input_path = tmp_path / "clip.wav"
+    input_path.write_bytes(b"fake")
+    job = MediaJob(input_path=input_path, output_dir=tmp_path / "out", stem="clip")
+    config = CaptionConfig(source_language="English", target_language="zh")
+    final_dir = tmp_path / "out" / "srt" / "final"
+    final_dir.mkdir(parents=True)
+    (final_dir / "clip_en.srt").write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8")
+    (final_dir / "clip_zh.srt").write_text("1\n00:00:00,000 --> 00:00:01,000\n你好\n", encoding="utf-8")
+    (final_dir / "clip.srt").write_text("   \n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid subtitle cache file"):
+        process_job(job, config, asr=FakeAsr(), translator=FailingTranslator(), save_asr_json=False)
 
 
 def test_process_job_rejects_invalid_asr_cache(tmp_path: Path) -> None:
@@ -318,7 +366,7 @@ def test_run_pipeline_overlaps_asr_with_translation(tmp_path: Path) -> None:
     )
 
     assert asr.calls == ["a.wav", "b.wav"]
-    assert [output.bilingual_srt.name for output in outputs] == ["a.bilingual.srt", "b.bilingual.srt"]
+    assert [output.bilingual_srt.name for output in outputs] == ["a.srt", "b.srt"]
     assert all(output.bilingual_srt.exists() for output in outputs)
 
 
@@ -336,6 +384,114 @@ def test_run_pipeline_stops_asr_after_translation_failure(tmp_path: Path) -> Non
         )
 
     assert asr.calls == ["a.wav", "b.wav"]
+
+
+def test_process_job_embeds_source_target_and_default_bilingual(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    input_path = tmp_path / "clip.wav"
+    input_path.write_bytes(b"fake")
+    job = MediaJob(input_path=input_path, output_dir=tmp_path / "out", stem="clip")
+    recorded: list[tuple[Path, Path, list[SubtitleTrack]]] = []
+
+    def fake_mux(media_path: Path, output_path: Path, tracks: list[SubtitleTrack]) -> None:
+        recorded.append((media_path, output_path, tracks))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"mkv")
+
+    monkeypatch.setattr("caption.pipeline.mux_subtitles", fake_mux)
+    paths = process_job(
+        job,
+        CaptionConfig(source_language="English", target_language="zh", embed=True),
+        asr=FakeAsr(),
+        translator=FakeTranslator(),
+        save_asr_json=False,
+    )
+
+    assert recorded == [
+        (
+            input_path,
+            paths.mkv,
+            [
+                SubtitleTrack(paths.source_srt, "eng", "English", default=False),
+                SubtitleTrack(paths.target_srt, "chi", "Chinese", default=False),
+                SubtitleTrack(paths.bilingual_srt, "mul", "Bilingual", default=True),
+            ],
+        )
+    ]
+    assert paths.mkv == tmp_path / "out" / "mkv" / "clip.mkv"
+    assert paths.mkv.exists()
+    assert paths.mkv in paths.written_paths
+
+
+def test_process_job_embeds_only_the_source_track_without_translation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    input_path = tmp_path / "clip.wav"
+    input_path.write_bytes(b"fake")
+    job = MediaJob(input_path=input_path, output_dir=tmp_path / "out", stem="clip")
+    recorded: list[list[SubtitleTrack]] = []
+
+    def fake_mux(media_path: Path, output_path: Path, tracks: list[SubtitleTrack]) -> None:
+        recorded.append(tracks)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"mkv")
+
+    monkeypatch.setattr("caption.pipeline.mux_subtitles", fake_mux)
+    paths = process_job(
+        job,
+        CaptionConfig(source_language="English", target_language=None, embed=True),
+        asr=FakeAsr(),
+        translator=None,
+        save_asr_json=False,
+    )
+
+    assert recorded == [[SubtitleTrack(paths.source_srt, "eng", "English", default=True)]]
+    assert paths.mkv in paths.written_paths
+
+
+def test_plain_text_embed_uses_the_asr_subtitle_track(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    input_path = tmp_path / "clip.wav"
+    input_path.write_bytes(b"fake")
+    job = MediaJob(input_path=input_path, output_dir=tmp_path / "out", stem="clip")
+    recorded: list[list[SubtitleTrack]] = []
+
+    def fake_mux(media_path: Path, output_path: Path, tracks: list[SubtitleTrack]) -> None:
+        recorded.append(tracks)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"mkv")
+
+    monkeypatch.setattr("caption.pipeline.mux_subtitles", fake_mux)
+    paths = process_job(
+        job,
+        CaptionConfig(source_language="English", target_language=None, plain_text=True, embed=True),
+        asr=FakeAsr(),
+        translator=None,
+        save_asr_json=False,
+    )
+
+    assert recorded == [[SubtitleTrack(paths.asr_srt, "eng", "English", default=True)]]
+    assert paths.mkv in paths.written_paths
+    assert paths.source_srt not in paths.written_paths
+
+
+def test_process_job_skips_mkv_mux_when_embed_is_disabled(tmp_path: Path) -> None:
+    input_path = tmp_path / "clip.wav"
+    input_path.write_bytes(b"fake")
+    job = MediaJob(input_path=input_path, output_dir=tmp_path / "out", stem="clip")
+
+    paths = process_job(
+        job,
+        CaptionConfig(source_language="English", target_language="zh", embed=False),
+        asr=FakeAsr(),
+        translator=FakeTranslator(),
+        save_asr_json=False,
+    )
+
+    assert not paths.mkv.exists()
+    assert paths.mkv not in paths.written_paths
 
 
 def test_run_pipeline_without_llm_stays_sequential(tmp_path: Path) -> None:

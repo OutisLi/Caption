@@ -46,6 +46,8 @@ class OutputPaths:
         Target-language plain text path.
     bilingual_srt : Path
         Bilingual subtitle path.
+    mkv : Path
+        Final MKV with embedded subtitle tracks.
     raw_source_srt : Path | None
         Pre-review source-language subtitle path.
     raw_source_txt : Path | None
@@ -69,6 +71,7 @@ class OutputPaths:
     target_srt: Path
     target_txt: Path
     bilingual_srt: Path
+    mkv: Path
     raw_source_srt: Path | None = None
     raw_source_txt: Path | None = None
     raw_target_srt: Path | None = None
@@ -338,6 +341,8 @@ class CaptionConfig:
         Whether to write TXT sidecar files outside plain-text mode.
     review : bool
         Whether translations are refined through review rounds after the first pass.
+    embed : bool
+        Whether to mux the finished subtitles into an MKV of the source media.
     """
 
     target_language: str | None
@@ -348,3 +353,4 @@ class CaptionConfig:
     plain_text: bool = False
     write_text: bool = False
     review: bool = False
+    embed: bool = False
