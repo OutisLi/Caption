@@ -18,6 +18,7 @@ dir = "outputs"
 save_asr_json = true
 
 [subtitle]
+target_lang = "zh"  # translation target language; empty string disables translation
 translation_position = "bottom"
 max_chars_per_cue = 60
 max_seconds_per_cue = 6.0

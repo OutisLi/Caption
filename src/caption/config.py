@@ -30,6 +30,7 @@ class RuntimeConfig:
     aligner_model: str
     model_cache_dir: Path | None
     translation_position: str
+    target_lang: str
     max_chars_per_cue: int
     max_seconds_per_cue: float
     optimization_window_seconds: float
@@ -87,6 +88,7 @@ def load_runtime_config(path: Path) -> RuntimeConfig:
         aligner_model=str(asr.get("aligner_model", DEFAULT_ALIGNER_MODEL)).strip() or DEFAULT_ALIGNER_MODEL,
         model_cache_dir=Path(model_cache_dir) if model_cache_dir else None,
         translation_position=translation_position,
+        target_lang=str(subtitle.get("target_lang", "zh")).strip(),
         max_chars_per_cue=int(subtitle.get("max_chars_per_cue", 60)),
         max_seconds_per_cue=float(subtitle.get("max_seconds_per_cue", 6.0)),
         optimization_window_seconds=float(subtitle.get("optimization_window_seconds", 30.0)),

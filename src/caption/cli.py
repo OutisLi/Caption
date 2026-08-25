@@ -42,7 +42,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--text", action="store_true", help="Write TXT sidecar files outside plain-text mode.")
     parser.add_argument("--source-lang", default="", help="Optional ASR source language. Empty means auto-detect.")
     parser.add_argument(
-        "--target-lang", default="zh", help='Translation target language. Use --target-lang "" to disable translation.'
+        "--target-lang",
+        default=None,
+        help='Translation target language. Overrides config [subtitle] target_lang. Use --target-lang "" to disable translation.',
     )
     parser.add_argument(
         "--plain-text", action="store_true", help="Only write raw source-language SRT and TXT from ASR; skip LLM."
@@ -71,7 +73,7 @@ def require_llm_settings(config: RuntimeConfig) -> LlmSettings:
     return config.llm
 
 
-def needs_llm(args: argparse.Namespace, config: RuntimeConfig) -> bool:
+def needs_llm(args: argparse.Namespace, target_lang: str, config: RuntimeConfig) -> bool:
     """
     Return whether this invocation needs an LLM client.
 
@@ -79,6 +81,8 @@ def needs_llm(args: argparse.Namespace, config: RuntimeConfig) -> bool:
     ----------
     args : argparse.Namespace
         Parsed CLI arguments.
+    target_lang : str
+        Resolved translation target language. Empty means no translation.
     config : RuntimeConfig
         Runtime configuration.
 
@@ -87,7 +91,7 @@ def needs_llm(args: argparse.Namespace, config: RuntimeConfig) -> bool:
     bool
         True when translation or subtitle optimization will run.
     """
-    return not args.plain_text and (bool(args.target_lang) or config.optimize_subtitles)
+    return not args.plain_text and (bool(target_lang) or config.optimize_subtitles)
 
 
 def apply_model_cache_dir(config: RuntimeConfig) -> None:
@@ -117,9 +121,10 @@ def main(argv: list[str] | None = None) -> int:
         args = parse_args(argv)
         runtime_config = load_runtime_config(CONFIG_PATH)
         apply_model_cache_dir(runtime_config)
+        target_lang = (args.target_lang if args.target_lang is not None else runtime_config.target_lang).strip()
         config = CaptionConfig(
             source_language=args.source_lang or None,
-            target_language=args.target_lang or None,
+            target_language=target_lang or None,
             translation_position=runtime_config.translation_position,
             max_chars_per_cue=runtime_config.max_chars_per_cue,
             max_seconds_per_cue=runtime_config.max_seconds_per_cue,
@@ -127,7 +132,7 @@ def main(argv: list[str] | None = None) -> int:
             write_text=args.text,
         )
         translator = None
-        if needs_llm(args, runtime_config):
+        if needs_llm(args, target_lang, runtime_config):
             llm = require_llm_settings(runtime_config)
             completion_client = create_llm_completion_client(
                 provider=llm.provider,
@@ -142,7 +147,7 @@ def main(argv: list[str] | None = None) -> int:
             log_step("LLM preflight succeeded", icon="✅")
             translator = LlmTranslator(
                 completion_client=completion_client,
-                target_language=args.target_lang or "",
+                target_language=target_lang,
                 concurrency=llm.concurrency,
                 optimization_retries=llm.optimization_retries,
                 optimization_window_seconds=runtime_config.optimization_window_seconds,

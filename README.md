@@ -89,7 +89,7 @@ optimize = true
 caption input.mp4
 ```
 
-默认目标语言是中文。要关闭翻译但保留分句优化，可以传空字符串：
+默认目标语言是中文，由 `config.toml` 中 `subtitle.target_lang` 控制，改成空字符串即可默认关闭翻译。也可以按次用 CLI 覆盖：
 
 ```bash
 caption input.mp4 --target-lang ""
@@ -129,7 +129,7 @@ caption /path/to/media_folder
 - `raw/<relative>/<name>.raw.source.srt`：LLM 优化前的源语言字幕。
 - `raw/<relative>/<name>.raw.target.srt`、`raw/<relative>/<name>.raw.bilingual.srt`：LLM 优化前的翻译字幕。
 - `final/<relative>/<name>.source.srt`：最终源语言字幕。
-- `final/<relative>/<name>.target.srt`：最终目标语言字幕。默认目标语言是 `zh`；传 `--target-lang ""` 时不生成。
+- `final/<relative>/<name>.target.srt`：最终目标语言字幕。默认目标语言是 `zh`；目标语言为空（config 或 `--target-lang ""`）时不生成。
 - `final/<relative>/<name>.bilingual.srt`：最终双语字幕。
 - `raw/<relative>/*.txt`、`final/<relative>/*.txt`：对应阶段的纯文本文件，仅 `--text` 时生成。
 
@@ -138,10 +138,10 @@ caption /path/to/media_folder
 ## 工作流
 
 1. 发现输入媒体文件。
-2. 本地 Qwen3-ASR 识别音频。
+2. 如果 `asr/<relative>/<name>.asr.json` 已存在，直接复用该缓存并跳过语音识别；否则本地 Qwen3-ASR 识别音频。
 3. ASR 完成后立即写出 `asr/*.asr.json` 和 `asr/*.asr.srt`，传入 `--text` 或 `--plain-text` 时同时写出 `asr/*.asr.txt`。
 4. 如果传入 `--plain-text`，流程到此结束。
-5. 默认翻译到中文并保存 `raw/` 字幕；传 `--target-lang ""` 时跳过翻译。
+5. 默认翻译到中文并保存 `raw/` 字幕；目标语言为空（config 或 `--target-lang ""`）时跳过翻译。
 6. 如果 `config.toml` 中 `subtitle.optimize = true`，LLM 会按配置窗口结合时间戳重新做语义分句和字幕优化。
 7. 写出 `final/` SRT；传入 `--text` 时同时写出 TXT。
 

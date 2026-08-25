@@ -163,13 +163,17 @@ def process_job(
     paths = build_output_paths(job.output_dir, job.relative_output_dir, job.stem, save_asr_json)
     written_paths: list[Path] = []
 
-    log_step(f"ASR started: {job.input_path}", icon="🎙️")
-    asr_result = asr.transcribe(job.input_path, language=config.source_language)
-    if paths.asr_json is not None:
-        paths.asr_json.parent.mkdir(parents=True, exist_ok=True)
-        paths.asr_json.write_text(json.dumps(asdict(asr_result), ensure_ascii=False, indent=2), encoding="utf-8")
-        written_paths.append(paths.asr_json)
-        log_step(f"ASR JSON saved: {paths.asr_json}", icon="💾")
+    asr_result = _load_cached_asr_result(paths.asr_json)
+    if asr_result is not None:
+        log_step(f"ASR cache reused: {paths.asr_json}", icon="♻️")
+    else:
+        log_step(f"ASR started: {job.input_path}", icon="🎙️")
+        asr_result = asr.transcribe(job.input_path, language=config.source_language)
+        if paths.asr_json is not None:
+            paths.asr_json.parent.mkdir(parents=True, exist_ok=True)
+            paths.asr_json.write_text(json.dumps(asdict(asr_result), ensure_ascii=False, indent=2), encoding="utf-8")
+            written_paths.append(paths.asr_json)
+            log_step(f"ASR JSON saved: {paths.asr_json}", icon="💾")
     if not asr_result.words:
         raise ValueError(f"ASR returned no timestamped words for {job.input_path}")
 
@@ -247,6 +251,39 @@ def process_job(
         log_step(f"Final source output saved: {paths.source_srt}", icon="✅")
 
     return replace(paths, written_paths=tuple(written_paths))
+
+
+def _load_cached_asr_result(path: Path | None) -> AsrResult | None:
+    """
+    Load a previously persisted ASR result when available.
+
+    Parameters
+    ----------
+    path : Path | None
+        ASR JSON path. None or a missing file means no cache.
+
+    Returns
+    -------
+    AsrResult | None
+        Cached ASR result, or None when no cache exists.
+
+    Raises
+    ------
+    ValueError
+        If the cache file exists but is not a valid ASR result.
+    """
+    if path is None or not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        words = [
+            WordSpan(text=str(word["text"]), start=float(word["start"]), end=float(word["end"]))
+            for word in data["words"]
+        ]
+        chunks = list(data.get("chunks", []))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"invalid ASR cache file {path}: {exc}") from exc
+    return AsrResult(text=str(data.get("text", "")), language=str(data.get("language", "")), words=words, chunks=chunks)
 
 
 def _write_source_outputs(

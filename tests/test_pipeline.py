@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from caption.pipeline import process_job
 from caption.types import AsrResult, CaptionConfig, MediaJob, SubtitleCue, WordSpan
 
@@ -170,3 +172,38 @@ def test_asr_outputs_are_saved_before_translation_failure(tmp_path: Path) -> Non
         encoding="utf-8"
     ) == "1\n00:00:00,000 --> 00:00:01,000\nHello world.\n"
     assert not (tmp_path / "out" / "asr" / "clip.asr.txt").exists()
+
+
+class ExplodingAsr:
+    def transcribe(self, audio_path: Path, language: str | None = None) -> AsrResult:
+        raise AssertionError("ASR must not run when a cached result exists")
+
+
+def test_process_job_reuses_cached_asr_json(tmp_path: Path) -> None:
+    input_path = tmp_path / "clip.wav"
+    input_path.write_bytes(b"fake")
+    job = MediaJob(input_path=input_path, output_dir=tmp_path / "out", stem="clip")
+    config = CaptionConfig(source_language="English", target_language="zh")
+
+    first = process_job(job, config, asr=FakeAsr(), translator=FakeTranslator(), optimizer=None, save_asr_json=True)
+    assert first.asr_json is not None and first.asr_json.exists()
+
+    paths = process_job(job, config, asr=ExplodingAsr(), translator=FakeTranslator(), optimizer=None, save_asr_json=True)
+
+    assert paths.asr_json is not None
+    assert paths.asr_json not in paths.written_paths
+    assert paths.source_srt.read_text(encoding="utf-8") == "1\n00:00:00,000 --> 00:00:01,000\nHello world.\n"
+    assert paths.target_srt.read_text(encoding="utf-8") == "1\n00:00:00,000 --> 00:00:01,000\n你好，世界。\n"
+
+
+def test_process_job_rejects_invalid_asr_cache(tmp_path: Path) -> None:
+    input_path = tmp_path / "clip.wav"
+    input_path.write_bytes(b"fake")
+    job = MediaJob(input_path=input_path, output_dir=tmp_path / "out", stem="clip")
+    config = CaptionConfig(source_language="English", target_language="zh")
+    cache_path = tmp_path / "out" / "asr" / "clip.asr.json"
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text('{"text": "oops"}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid ASR cache file"):
+        process_job(job, config, asr=ExplodingAsr(), translator=FakeTranslator(), optimizer=None, save_asr_json=True)

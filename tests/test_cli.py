@@ -226,3 +226,43 @@ optimize = false
     monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
 
     assert cli.main([str(input_path), "--target-lang", ""]) == 0
+
+
+def test_config_target_lang_drives_default_and_cli_overrides(
+    tmp_path: cli.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "config.toml").write_text(
+        """
+[llm]
+api_key = "key"
+model = "model"
+
+[subtitle]
+target_lang = "ja"
+optimize = false
+""",
+        encoding="utf-8",
+    )
+    input_path = tmp_path / "clip.wav"
+    input_path.write_bytes(b"fake")
+    seen_languages: list[str | None] = []
+
+    def fake_run_pipeline(
+        input_path: cli.Path,
+        output_dir: cli.Path,
+        config: CaptionConfig,
+        **kwargs: object,
+    ) -> list[OutputPaths]:
+        seen_languages.append(config.target_language)
+        return []
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "LocalMlxAsr", lambda **kwargs: object())
+    monkeypatch.setattr(cli, "create_llm_completion_client", lambda **kwargs: object())
+    monkeypatch.setattr(cli, "validate_llm_completion_client", lambda client: None)
+    monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
+
+    assert cli.main([str(input_path)]) == 0
+    assert cli.main([str(input_path), "--target-lang", ""]) == 0
+
+    assert seen_languages == ["ja", None]

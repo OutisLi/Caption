@@ -48,7 +48,7 @@ Keep these in `config.toml`:
 - LLM API key, base URL, model, thinking settings, concurrency, retry count. These are required only when translation or optimization uses the LLM.
 - ASR model paths and model cache directory.
 - Output directory and ASR JSON persistence.
-- Subtitle formatting and optimization settings.
+- Subtitle formatting, optimization settings, and the default target language (`subtitle.target_lang`).
 
 Keep these as CLI flags:
 
@@ -58,7 +58,7 @@ Keep these as CLI flags:
 - `--plain-text`
 - `--text`
 
-`--target-lang` defaults to `zh`. Passing an empty string disables translation.
+`subtitle.target_lang` in `config.toml` sets the default target language (`zh` when unset). `--target-lang` overrides it per run. An empty string in either place disables translation.
 
 Do not add low-frequency runtime knobs to the CLI unless explicitly requested.
 
@@ -89,6 +89,7 @@ Keep files focused. Do not create large multi-purpose modules.
 - Do not silently fall back from optimized subtitles to raw subtitles.
 - Retry optimization according to `llm.optimization_retries`.
 - If a stage succeeds, persist its output before starting the next stage.
+- When `asr/*.asr.json` already exists for a media file, reuse it and skip ASR. Invalid cache files must raise an error instead of triggering re-transcription.
 - Keep output layout centralized in `src/caption/media.py`: ASR artifacts under `asr/`, unoptimized LLM artifacts under `raw/`, final artifacts under `final/`.
 - For folder inputs, preserve only the input root's internal relative layout. Never include parent directories before the user-provided input root.
 - Write TXT sidecar files only when `--text` is set, except `--plain-text`, which always writes ASR SRT and TXT.
