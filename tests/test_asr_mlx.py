@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from caption.asr_mlx import DEFAULT_ALIGNER_MODEL, DEFAULT_ASR_MODEL, LocalMlxAsr
+from caption.asr_mlx import LocalMlxAsr
 
 
 class FakeResult:
@@ -38,7 +38,7 @@ class SmallOverlapSession:
         return SmallOverlapResult()
 
 
-def test_local_mlx_asr_uses_default_models_and_normalizes_words(tmp_path: Path) -> None:
+def test_local_mlx_asr_loads_the_requested_models_and_normalizes_words(tmp_path: Path) -> None:
     sessions: list[FakeSession] = []
     aligner_models: list[str] = []
 
@@ -51,23 +51,30 @@ def test_local_mlx_asr_uses_default_models_and_normalizes_words(tmp_path: Path) 
         aligner_models.append(model)
         return f"aligner:{model}"
 
-    asr = LocalMlxAsr(session_factory=session_factory, aligner_factory=aligner_factory)
+    asr = LocalMlxAsr(
+        model="asr-model",
+        aligner_model="aligner-model",
+        session_factory=session_factory,
+        aligner_factory=aligner_factory,
+    )
     audio_path = tmp_path / "clip.wav"
 
     result = asr.transcribe(audio_path, language="English")
 
-    assert sessions[0].model == DEFAULT_ASR_MODEL
-    assert aligner_models == [DEFAULT_ALIGNER_MODEL]
+    assert sessions[0].model == "asr-model"
+    assert aligner_models == ["aligner-model"]
     assert result.text == "Hello world."
     assert result.language == "English"
     assert [(word.text, word.start, word.end) for word in result.words] == [("Hello", 0.0, 0.4), ("world.", 0.4, 1.0)]
     assert sessions[0].calls[0]["return_timestamps"] is True
     assert sessions[0].calls[0]["return_chunks"] is True
-    assert sessions[0].calls[0]["forced_aligner"] == f"aligner:{DEFAULT_ALIGNER_MODEL}"
+    assert sessions[0].calls[0]["forced_aligner"] == "aligner:aligner-model"
 
 
 def test_local_mlx_asr_clamps_small_timestamp_overlaps(tmp_path: Path) -> None:
     asr = LocalMlxAsr(
+        model="asr-model",
+        aligner_model="aligner-model",
         session_factory=lambda model: SmallOverlapSession(),
         aligner_factory=lambda model: f"aligner:{model}",
     )

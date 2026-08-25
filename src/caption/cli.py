@@ -7,14 +7,11 @@ from pathlib import Path
 
 from caption.asr_mlx import LocalMlxAsr
 from caption.config import LlmSettings, RuntimeConfig, load_runtime_config
+from caption.llm_client import create_llm_completion_client, validate_llm_completion_client
+from caption.llm_json import TranslationError
 from caption.pipeline import run_pipeline
 from caption.progress import log_step
-from caption.translator import (
-    LlmTranslator,
-    TranslationError,
-    create_llm_completion_client,
-    validate_llm_completion_client,
-)
+from caption.translator import LlmTranslator
 from caption.types import CaptionConfig
 
 CONFIG_PATH = Path("config.toml")
@@ -73,7 +70,7 @@ def require_llm_settings(config: RuntimeConfig) -> LlmSettings:
     return config.llm
 
 
-def needs_llm(args: argparse.Namespace, target_lang: str, config: RuntimeConfig) -> bool:
+def needs_llm(args: argparse.Namespace, target_lang: str, segmentation: str) -> bool:
     """
     Return whether this invocation needs an LLM client.
 
@@ -83,15 +80,16 @@ def needs_llm(args: argparse.Namespace, target_lang: str, config: RuntimeConfig)
         Parsed CLI arguments.
     target_lang : str
         Resolved translation target language. Empty means no translation.
-    config : RuntimeConfig
-        Runtime configuration.
+    segmentation : str
+        Configured segmentation mode, ``llm`` or ``asr``.
 
     Returns
     -------
     bool
-        True when translation or subtitle optimization will run.
+        True when sentence segmentation or translation will run. Review refines
+        translations, so it never triggers the LLM on its own.
     """
-    return not args.plain_text and (bool(target_lang) or config.optimize_subtitles)
+    return not args.plain_text and (segmentation == "llm" or bool(target_lang))
 
 
 def apply_model_cache_dir(config: RuntimeConfig) -> None:
@@ -121,24 +119,28 @@ def main(argv: list[str] | None = None) -> int:
         args = parse_args(argv)
         runtime_config = load_runtime_config(CONFIG_PATH)
         apply_model_cache_dir(runtime_config)
-        target_lang = (args.target_lang if args.target_lang is not None else runtime_config.target_lang).strip()
+        subtitle = runtime_config.subtitle
+        target_lang = (args.target_lang if args.target_lang is not None else subtitle.target_lang).strip()
         config = CaptionConfig(
             source_language=args.source_lang or None,
             target_language=target_lang or None,
-            translation_position=runtime_config.translation_position,
-            max_chars_per_cue=runtime_config.max_chars_per_cue,
-            max_seconds_per_cue=runtime_config.max_seconds_per_cue,
+            translation_position=subtitle.translation_position,
+            max_chars_per_cue=subtitle.max_chars_per_cue,
+            max_seconds_per_cue=subtitle.max_seconds_per_cue,
             plain_text=args.plain_text,
             write_text=args.text,
+            review=subtitle.review_rounds > 0,
         )
         translator = None
-        if needs_llm(args, target_lang, runtime_config):
+        if needs_llm(args, target_lang, subtitle.segmentation):
             llm = require_llm_settings(runtime_config)
             completion_client = create_llm_completion_client(
                 provider=llm.provider,
                 api_key=llm.api_key,
                 base_url=llm.base_url,
                 model=llm.model,
+                thinking_sampling=llm.thinking_sampling,
+                instruct_sampling=llm.instruct_sampling,
                 enable_thinking=llm.enable_thinking,
                 reasoning_effort=llm.reasoning_effort,
                 request_timeout=llm.request_timeout,
@@ -150,12 +152,11 @@ def main(argv: list[str] | None = None) -> int:
                 completion_client=completion_client,
                 target_language=target_lang,
                 concurrency=llm.concurrency,
-                optimization_retries=llm.optimization_retries,
-                optimization_window_seconds=runtime_config.optimization_window_seconds,
-                max_segment_seconds=runtime_config.max_optimized_seconds,
-                max_target_chars=runtime_config.max_optimized_target_chars,
-                min_segment_seconds=runtime_config.min_optimized_seconds,
-                pause_seconds=runtime_config.optimization_pause_seconds,
+                retries=llm.retries,
+                max_line_seconds=subtitle.max_seconds_per_cue,
+                max_line_chars=subtitle.max_chars_per_cue,
+                review_rounds=subtitle.review_rounds,
+                review_pass_score=subtitle.review_pass_score,
             )
         asr = LocalMlxAsr(model=runtime_config.asr_model, aligner_model=runtime_config.aligner_model)
         outputs = run_pipeline(
@@ -164,7 +165,6 @@ def main(argv: list[str] | None = None) -> int:
             config=config,
             asr=asr,
             translator=translator,
-            optimizer=translator if translator is not None and runtime_config.optimize_subtitles else None,
             save_asr_json=runtime_config.save_asr_json,
         )
     except (FileNotFoundError, ValueError, TranslationError) as exc:

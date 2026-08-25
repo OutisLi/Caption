@@ -1,13 +1,40 @@
+# Copy to config.toml and edit. Every key below may be deleted: omitted keys fall back to
+# src/caption/defaults.toml, and the values shown here are exactly those defaults.
+# Only api_key, model, base_url, and the [asr] paths have no default and must be set for
+# the features that use them.
+
 [llm]
-concurrency = 5
-optimization_retries = 20
-request_timeout = 30
 provider = "openai"  # openai or anthropic
 base_url = "https://api.deepseek.com"
 model = "deepseek-v4-flash"
 api_key = "YOUR_API_KEY"
+concurrency = 4
+retries = 3  # attempts per LLM request before the run fails
+request_timeout = 30
 enable_thinking = true
 reasoning_effort = "high"
+
+# Sampling per generation mode, following the Qwen3 recommendations. Which set applies
+# follows the per-task reasoning switch: [llm.thinking] for glossary extraction and
+# revision, [llm.instruct] for sentence splitting, translation, and scoring.
+# top_k, min_p, and repetition_penalty are extensions sent through extra_body.
+[llm.thinking]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+min_p = 0.0
+presence_penalty = 0.0
+repetition_penalty = 1.0
+
+[llm.instruct]
+temperature = 0.7
+top_p = 0.80
+top_k = 20
+min_p = 0.0
+# Vendor value tuned for prose. Every request here asks for JSON, whose key names must
+# repeat, so lower this first if responses stop parsing.
+presence_penalty = 1.5
+repetition_penalty = 1.0
 
 [asr]
 model = "models/asr/Qwen3-ASR-1.7B-8bit"
@@ -19,13 +46,19 @@ dir = "outputs"
 save_asr_json = true
 
 [subtitle]
+# How the transcript is divided into subtitles.
+#   "llm" - the LLM locates sentence boundaries in the word stream.
+#   "asr" - the raw word stream is cut by the display limits alone, without any LLM.
+# Translation requires "llm", because a fragment cut at a fixed length is not translatable.
+segmentation = "llm"
+
 target_lang = "zh"  # translation target language; empty string disables translation
 translation_position = "bottom"
-max_chars_per_cue = 60
+
+# Display limits. A sentence is split into as many lines as these limits require.
 max_seconds_per_cue = 6.0
-optimization_window_seconds = 30.0
-max_optimized_seconds = 6.0
-max_optimized_target_chars = 25
-min_optimized_seconds = 2.5
-optimization_pause_seconds = 1.0
-optimize = true
+max_chars_per_cue = 60
+
+# Score-and-revise loop. Set review_rounds = 0 to publish the first pass unchanged.
+review_rounds = 2
+review_pass_score = 4  # lowest score (1-5) accepted without revision

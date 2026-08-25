@@ -6,8 +6,6 @@ from typing import Any, Callable
 from caption.types import AsrResult, WordSpan
 from caption.progress import AsrProgress
 
-DEFAULT_ASR_MODEL = "mlx-community/Qwen3-ASR-1.7B-8bit"
-DEFAULT_ALIGNER_MODEL = "mlx-community/Qwen3-ForcedAligner-0.6B-8bit"
 MAX_TIMESTAMP_OVERLAP_SECONDS = 0.2
 
 SessionFactory = Callable[[str], Any]
@@ -15,12 +13,16 @@ AlignerFactory = Callable[[str], Any]
 
 
 class LocalMlxAsr:
-    """Transcribe media with MLX Qwen3-ASR and a forced aligner."""
+    """Transcribe media with MLX Qwen3-ASR and a forced aligner.
+
+    Model selection is a runtime setting and therefore always supplied by the caller;
+    the adapter carries no default of its own.
+    """
 
     def __init__(
         self,
-        model: str = DEFAULT_ASR_MODEL,
-        aligner_model: str = DEFAULT_ALIGNER_MODEL,
+        model: str,
+        aligner_model: str,
         session_factory: SessionFactory | None = None,
         aligner_factory: AlignerFactory | None = None,
     ) -> None:

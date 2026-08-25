@@ -1,233 +1,178 @@
-"""Parse and apply structured LLM subtitle responses."""
+"""Parse and validate structured LLM responses."""
 
 import json
 from collections.abc import Sequence
 from dataclasses import replace
 
-from caption.segment import validate_word_spans
-from caption.types import SubtitleCue, WordSpan
+from caption.types import GlossaryTerm, SentenceReview, SubtitleLine, TranscriptGlossary
+
+MIN_REVIEW_SCORE = 1
+MAX_REVIEW_SCORE = 5
 
 
 class TranslationError(RuntimeError):
     """Raised when the LLM response cannot be trusted."""
 
 
-def parse_translation_response(response_text: str, expected_ids: Sequence[int]) -> dict[int, str]:
+def parse_sentence_boundaries(response_text: str) -> tuple[list[int], list[int]]:
     """
-    Parse and validate LLM translation JSON.
+    Parse a sentence-boundary response.
+
+    Only the JSON shape is checked here. Whether an individual id can be honoured depends
+    on the batch it describes and is decided where the words are known; an id that cannot
+    be is dropped rather than rejected, so this stage has no way to fail on content.
+
+    Parameters
+    ----------
+    response_text : str
+        Raw LLM response.
+
+    Returns
+    -------
+    tuple[list[int], list[int]]
+        Reported sentence-end ids and line-break ids, as given.
+
+    Raises
+    ------
+    TranslationError
+        If the JSON is invalid or either field is not a list of integers.
+    """
+    data = _load_json_object(response_text, "sentence split")
+    return _int_list(data, "sentence_ends"), _int_list(data, "line_breaks")
+
+
+def _int_list(data: dict, field: str) -> list[int]:
+    values = data.get(field, [])
+    if not isinstance(values, list):
+        raise TranslationError(f"sentence split {field} must be a list")
+    return [_required_int(value, f"sentence split {field} entry") for value in values]
+
+
+def parse_glossary_response(response_text: str) -> TranscriptGlossary:
+    """
+    Parse a terminology extraction response.
+
+    Parameters
+    ----------
+    response_text : str
+        Raw LLM response.
+
+    Returns
+    -------
+    TranscriptGlossary
+        Transcript topic and required term renderings. Terms with an empty source or
+        target are dropped, since they constrain nothing.
+
+    Raises
+    ------
+    TranslationError
+        If the JSON is invalid or the terms field is not a list.
+    """
+    data = _load_json_object(response_text, "glossary")
+    raw_terms = data.get("terms", [])
+    if not isinstance(raw_terms, list):
+        raise TranslationError("glossary response terms must be a list")
+    terms = []
+    for item in raw_terms:
+        if not isinstance(item, dict):
+            raise TranslationError("glossary term must be an object with source and target")
+        source = str(item.get("source", "")).strip()
+        target = str(item.get("target", "")).strip()
+        if source and target:
+            terms.append(GlossaryTerm(source=source, target=target))
+    return TranscriptGlossary(topic=str(data.get("topic", "")).strip(), terms=tuple(terms))
+
+
+def parse_translated_lines(response_text: str, layout: Sequence[SubtitleLine]) -> list[SubtitleLine]:
+    """
+    Parse a sentence translation response onto an existing display-line layout.
+
+    The layout is fixed by the audio timing before the request is sent, so the response
+    only supplies text. Requiring one entry per line makes the response verifiable
+    without any arithmetic on the model's side.
+
+    Parameters
+    ----------
+    response_text : str
+        Raw LLM response.
+    layout : Sequence[SubtitleLine]
+        Display lines whose spans the response must fill.
+
+    Returns
+    -------
+    list[SubtitleLine]
+        Layout lines carrying the translated text.
+
+    Raises
+    ------
+    TranslationError
+        If the JSON is invalid, the entry count does not match the layout, or a line
+        carries no text.
+    """
+    data = _load_json_object(response_text, "translation")
+    items = data.get("lines")
+    if not isinstance(items, list):
+        raise TranslationError("translation response must contain a lines list")
+    if len(items) != len(layout):
+        raise TranslationError(
+            f"translation response has {len(items)} line(s) but the layout has {len(layout)}"
+        )
+
+    lines: list[SubtitleLine] = []
+    for item, line in zip(items, layout):
+        if not isinstance(item, dict) or "source" not in item or "target" not in item:
+            raise TranslationError("translation line must contain source and target")
+        source_text = str(item["source"]).strip()
+        target_text = str(item["target"]).strip()
+        if not source_text or not target_text:
+            raise TranslationError("translation line must not be empty")
+        lines.append(replace(line, source_text=source_text, target_text=target_text))
+    return lines
+
+
+def parse_review_response(response_text: str, expected_ids: Sequence[int]) -> dict[int, SentenceReview]:
+    """
+    Parse a batched translation review response.
 
     Parameters
     ----------
     response_text : str
         Raw LLM response.
     expected_ids : Sequence[int]
-        Cue ids expected in the response.
+        Item ids submitted for review.
 
     Returns
     -------
-    dict[int, str]
-        Translation text by cue id.
+    dict[int, SentenceReview]
+        Review by item id.
 
     Raises
     ------
     TranslationError
-        If JSON is invalid or ids do not match.
+        If the JSON is invalid, a score is out of range, or the ids cannot be matched.
     """
-    try:
-        data = json.loads(strip_markdown_json(response_text))
-    except json.JSONDecodeError as exc:
-        raise TranslationError("translation response is not valid JSON") from exc
-
-    items = data.get("translations")
+    data = _load_json_object(response_text, "review")
+    items = data.get("reviews")
     if not isinstance(items, list):
-        raise TranslationError("translation response must contain a translations list")
+        raise TranslationError("review response must contain a reviews list")
 
-    translations: dict[int, str] = {}
-    ordered_texts: list[str] = []
+    reviews: dict[int, SentenceReview] = {}
+    ordered: list[SentenceReview] = []
     for item in items:
-        if not isinstance(item, dict) or "id" not in item or "text" not in item:
-            raise TranslationError("translation item must contain id and text")
-        text = str(item["text"]).strip()
-        translations[_required_int(item["id"], "translation id")] = text
-        ordered_texts.append(text)
+        if not isinstance(item, dict) or "id" not in item or "score" not in item:
+            raise TranslationError("review item must contain id and score")
+        review = SentenceReview(score=_review_score(item["score"]), issue=str(item.get("issue", "")).strip())
+        reviews[_required_int(item["id"], "review id")] = review
+        ordered.append(review)
 
-    if set(translations) != set(expected_ids):
-        if len(ordered_texts) == len(expected_ids):
-            return dict(zip(expected_ids, ordered_texts))
-        raise TranslationError("translation ids do not match input cue ids")
+    if set(reviews) != set(expected_ids):
+        # Local models routinely renumber batch items. Positional recovery is sound
+        # because the prompt requires one entry per input id in the input order.
+        if len(ordered) == len(expected_ids):
+            return dict(zip(expected_ids, ordered))
+        raise TranslationError("review ids do not match the submitted items")
 
-    return translations
-
-
-def parse_optimized_segments_response(
-    response_text: str,
-    source_tokens: Sequence[WordSpan],
-    max_segment_seconds: float | None = None,
-    max_target_chars: int | None = None,
-    min_segment_seconds: float | None = None,
-    pause_seconds: float = 0.6,
-) -> list[SubtitleCue]:
-    """
-    Parse LLM-optimized subtitle segments.
-
-    Parameters
-    ----------
-    response_text : str
-        Raw LLM response.
-    source_tokens : Sequence[WordSpan]
-        Source tokens used to compute timestamps.
-    max_segment_seconds : float | None
-        Optional maximum optimized cue duration.
-    max_target_chars : int | None
-        Optional maximum target-language cue length.
-    min_segment_seconds : float | None
-        Optional minimum optimized cue duration unless a nearby pause supports it.
-    pause_seconds : float
-        Pause length that allows a short standalone cue.
-
-    Returns
-    -------
-    list[SubtitleCue]
-        Optimized subtitle cues with temporary indices.
-
-    Raises
-    ------
-    TranslationError
-        If JSON is invalid or ids are missing, duplicated, skipped, or out of order.
-    """
-    try:
-        data = json.loads(strip_markdown_json(response_text))
-    except json.JSONDecodeError as exc:
-        raise TranslationError("optimized segments response is not valid JSON") from exc
-
-    items = data.get("items")
-    if not isinstance(items, list) or not items:
-        raise TranslationError("optimized segments response must contain a non-empty items list")
-
-    return _parse_token_optimized_segments(
-        data, source_tokens, max_segment_seconds, max_target_chars, min_segment_seconds, pause_seconds
-    )
-
-
-def _parse_token_optimized_segments(
-    data: dict,
-    source_tokens: Sequence[WordSpan],
-    max_segment_seconds: float | None,
-    max_target_chars: int | None,
-    min_segment_seconds: float | None,
-    pause_seconds: float,
-) -> list[SubtitleCue]:
-    items = data.get("items")
-    if not isinstance(items, list) or not items:
-        raise TranslationError("optimized segments response must contain a non-empty items list")
-    if not source_tokens:
-        raise TranslationError("source tokens must not be empty")
-    try:
-        validate_word_spans(source_tokens)
-    except ValueError as exc:
-        raise TranslationError(str(exc)) from exc
-
-    cursor = 1
-    cues: list[SubtitleCue] = []
-    for index, item in enumerate(items, start=1):
-        if (
-            not isinstance(item, dict)
-            or "start_token_id" not in item
-            or "end_token_id" not in item
-            or "source_text" not in item
-            or "target_text" not in item
-        ):
-            raise TranslationError(
-                "optimized segment must contain start_token_id, end_token_id, source_text, and target_text"
-            )
-        start_token_id = _required_int(item["start_token_id"], "start_token_id")
-        end_token_id = _required_int(item["end_token_id"], "end_token_id")
-        if start_token_id != cursor or end_token_id < start_token_id or end_token_id > len(source_tokens):
-            raise TranslationError("optimized token ranges must cover every input token exactly once in order")
-
-        first_token = source_tokens[start_token_id - 1]
-        last_token = source_tokens[end_token_id - 1]
-        duration = last_token.end - first_token.start
-        if max_segment_seconds is not None and duration > max_segment_seconds:
-            raise TranslationError("optimized segment duration exceeds maximum")
-        if (
-            len(items) > 1
-            and min_segment_seconds is not None
-            and duration < min_segment_seconds
-            and not _has_boundary_pause(source_tokens, start_token_id, end_token_id, pause_seconds)
-        ):
-            raise TranslationError("optimized segment is too short without a supporting pause")
-
-        target_text = str(item["target_text"]).strip()
-        if max_target_chars is not None and target_text and len(target_text) > max_target_chars:
-            raise TranslationError("optimized segment target text exceeds maximum")
-
-        cues.append(
-            SubtitleCue(
-                index=index,
-                start=first_token.start,
-                end=last_token.end,
-                source_text=str(item["source_text"]).strip(),
-                target_text=target_text,
-            )
-        )
-        cursor = end_token_id + 1
-
-    if cursor != len(source_tokens) + 1:
-        raise TranslationError("optimized token ranges did not cover all input tokens")
-    return cues
-
-
-def _has_boundary_pause(
-    source_tokens: Sequence[WordSpan], start_token_id: int, end_token_id: int, pause_seconds: float
-) -> bool:
-    previous_pause = (
-        start_token_id > 1
-        and source_tokens[start_token_id - 1].start - source_tokens[start_token_id - 2].end >= pause_seconds
-    )
-    next_pause = (
-        end_token_id < len(source_tokens)
-        and source_tokens[end_token_id].start - source_tokens[end_token_id - 1].end >= pause_seconds
-    )
-    return previous_pause or next_pause
-
-
-def _required_int(value: object, field_name: str) -> int:
-    if isinstance(value, bool):
-        raise TranslationError(f"{field_name} must be an integer")
-    try:
-        return int(value)
-    except (TypeError, ValueError) as exc:
-        raise TranslationError(f"{field_name} must be an integer") from exc
-
-
-def apply_translations(cues: Sequence[SubtitleCue], translations: dict[int, str]) -> list[SubtitleCue]:
-    """
-    Apply translated text to cues.
-
-    Parameters
-    ----------
-    cues : Sequence[SubtitleCue]
-        Source cues.
-    translations : dict[int, str]
-        Translation text by cue id.
-
-    Returns
-    -------
-    list[SubtitleCue]
-        New cues with target_text filled.
-
-    Raises
-    ------
-    TranslationError
-        If any cue has no translation.
-    """
-    result: list[SubtitleCue] = []
-    for cue in cues:
-        if cue.index not in translations:
-            raise TranslationError(f"missing translation for cue {cue.index}")
-        result.append(replace(cue, target_text=translations[cue.index]))
-    return result
+    return reviews
 
 
 def strip_markdown_json(text: str) -> str:
@@ -249,3 +194,29 @@ def strip_markdown_json(text: str) -> str:
         return stripped
     lines = stripped.splitlines()
     return "\n".join(lines[1:-1]).strip()
+
+
+def _load_json_object(response_text: str, kind: str) -> dict:
+    try:
+        data = json.loads(strip_markdown_json(response_text))
+    except json.JSONDecodeError as exc:
+        raise TranslationError(f"{kind} response is not valid JSON") from exc
+    if not isinstance(data, dict):
+        raise TranslationError(f"{kind} response must be a JSON object")
+    return data
+
+
+def _review_score(value: object) -> int:
+    score = _required_int(value, "review score")
+    if not MIN_REVIEW_SCORE <= score <= MAX_REVIEW_SCORE:
+        raise TranslationError(f"review score must be between {MIN_REVIEW_SCORE} and {MAX_REVIEW_SCORE}")
+    return score
+
+
+def _required_int(value: object, field_name: str) -> int:
+    if isinstance(value, bool):
+        raise TranslationError(f"{field_name} must be an integer")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise TranslationError(f"{field_name} must be an integer") from exc

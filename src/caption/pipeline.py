@@ -3,16 +3,25 @@
 import json
 import queue
 import threading
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Protocol
 
 from caption.media import build_output_paths, discover_media_jobs
 from caption.progress import log_step
-from caption.types import AsrResult, CaptionConfig, MediaJob, OutputPaths, SubtitleCue, WordSpan
-from caption.segment import build_cues
+from caption.segment import build_cues, build_cues_from_layouts
 from caption.srt import render_bilingual_srt, render_srt
+from caption.translator import TranslationDraft
+from caption.types import (
+    AsrResult,
+    CaptionConfig,
+    MediaJob,
+    OutputPaths,
+    SentenceLayout,
+    SubtitleCue,
+    WordSpan,
+)
 
 
 class AsrEngine(Protocol):
@@ -37,42 +46,51 @@ class AsrEngine(Protocol):
 
 
 class Translator(Protocol):
-    """Protocol for subtitle translators."""
+    """Protocol for the LLM subtitle stages."""
 
-    def translate(self, cues: list[SubtitleCue]) -> list[SubtitleCue]:
+    def segment(self, words: list[WordSpan]) -> list[SentenceLayout]:
         """
-        Translate subtitle cues.
+        Restore sentences and lay them out as display lines, without translating.
 
         Parameters
         ----------
-        cues : list[SubtitleCue]
-            Source subtitle cues.
+        words : list[WordSpan]
+            Timestamped ASR tokens.
 
         Returns
         -------
-        list[SubtitleCue]
-            Translated subtitle cues.
+        list[SentenceLayout]
+            Sentences with untranslated display lines.
         """
 
-
-class CaptionOptimizer(Protocol):
-    """Protocol for LLM subtitle text optimizers."""
-
-    def optimize(self, cues: list[SubtitleCue], tokens: list[WordSpan]) -> list[SubtitleCue]:
+    def translate(self, words: list[WordSpan]) -> TranslationDraft:
         """
-        Optimize source and target subtitle text and boundaries.
+        Restore sentences, build a glossary, and translate the transcript.
 
         Parameters
         ----------
-        cues : list[SubtitleCue]
-            Translated subtitle cues.
-        tokens : list[WordSpan]
-            Timestamped ASR tokens used for subtitle boundary decisions.
+        words : list[WordSpan]
+            Timestamped ASR tokens.
 
         Returns
         -------
-        list[SubtitleCue]
-            Optimized subtitle cues.
+        TranslationDraft
+            First-pass translation and the transcript context behind it.
+        """
+
+    def review(self, draft: TranslationDraft) -> list[SentenceLayout]:
+        """
+        Refine a first-pass translation through review rounds.
+
+        Parameters
+        ----------
+        draft : TranslationDraft
+            First-pass translation.
+
+        Returns
+        -------
+        list[SentenceLayout]
+            Sentences with revised text.
         """
 
 
@@ -82,7 +100,6 @@ def run_pipeline(
     config: CaptionConfig,
     asr: AsrEngine,
     translator: Translator | None,
-    optimizer: CaptionOptimizer | None = None,
     save_asr_json: bool = False,
 ) -> list[OutputPaths]:
     """
@@ -100,8 +117,6 @@ def run_pipeline(
         ASR engine.
     translator : Translator | None
         Optional translator. Required only for target-language translation.
-    optimizer : CaptionOptimizer | None
-        Optional subtitle text optimizer.
     save_asr_json : bool
         Whether to save ASR debug JSON.
 
@@ -119,18 +134,18 @@ def run_pipeline(
     if not jobs:
         raise ValueError(f"no media files found under {input_path}")
     log_step(f"Discovered {len(jobs)} media file(s)", icon="🔎")
-    if _can_overlap_stages(config, translator, optimizer):
-        return _run_overlapped(jobs, config, asr, translator, optimizer, save_asr_json)
+    if _can_overlap_stages(config, translator):
+        return _run_overlapped(jobs, config, asr, translator, save_asr_json)
     outputs: list[OutputPaths] = []
     for index, job in enumerate(jobs, start=1):
         log_step(f"Processing file {index}/{len(jobs)}: {job.input_path}", icon="📄")
-        outputs.append(process_job(job, config, asr, translator, optimizer, save_asr_json))
+        outputs.append(process_job(job, config, asr, translator, save_asr_json))
     return outputs
 
 
-def _can_overlap_stages(config: CaptionConfig, translator: Translator | None, optimizer: CaptionOptimizer | None) -> bool:
+def _can_overlap_stages(config: CaptionConfig, translator: Translator | None) -> bool:
     """Return whether ASR and LLM stages can overlap across files."""
-    return not config.plain_text and (translator is not None or optimizer is not None)
+    return not config.plain_text and translator is not None
 
 
 _PIPELINE_SENTINEL = object()
@@ -141,7 +156,6 @@ def _run_overlapped(
     config: CaptionConfig,
     asr: AsrEngine,
     translator: Translator | None,
-    optimizer: CaptionOptimizer | None,
     save_asr_json: bool,
 ) -> list[OutputPaths]:
     """
@@ -182,7 +196,7 @@ def _run_overlapped(
             if isinstance(item, Exception):
                 raise item
             paths, asr_result, written_paths = item  # type: ignore[misc]
-            outputs.append(_run_llm_stage(config, translator, optimizer, paths, asr_result, written_paths))
+            outputs.append(_run_llm_stage(config, translator, paths, asr_result, written_paths))
     except Exception:
         stop.set()
         producer.join()
@@ -196,7 +210,6 @@ def process_job(
     config: CaptionConfig,
     asr: AsrEngine,
     translator: Translator | None,
-    optimizer: CaptionOptimizer | None = None,
     save_asr_json: bool = False,
 ) -> OutputPaths:
     """
@@ -212,8 +225,6 @@ def process_job(
         ASR engine.
     translator : Translator | None
         Optional translator. Required only for target-language translation.
-    optimizer : CaptionOptimizer | None
-        Optional subtitle text optimizer.
     save_asr_json : bool
         Whether to save ASR debug JSON.
 
@@ -229,7 +240,7 @@ def process_job(
     """
     paths = build_output_paths(job.output_dir, job.relative_output_dir, job.stem, save_asr_json)
     asr_result, written_paths = _run_asr_stage(job, config, asr, paths)
-    return _run_llm_stage(config, translator, optimizer, paths, asr_result, written_paths)
+    return _run_llm_stage(config, translator, paths, asr_result, written_paths)
 
 
 def _run_asr_stage(
@@ -278,13 +289,12 @@ def _run_asr_stage(
 def _run_llm_stage(
     config: CaptionConfig,
     translator: Translator | None,
-    optimizer: CaptionOptimizer | None,
     paths: OutputPaths,
     asr_result: AsrResult,
     written_paths: list[Path],
 ) -> OutputPaths:
     """
-    Run the LLM stage for one job: translation, optional optimization, raw/final writes.
+    Run the LLM stage for one job: translation, optional review, raw and final writes.
 
     Parameters
     ----------
@@ -292,8 +302,6 @@ def _run_llm_stage(
         Caption generation configuration.
     translator : Translator | None
         Optional translator. Required only for target-language translation.
-    optimizer : CaptionOptimizer | None
-        Optional subtitle text optimizer.
     paths : OutputPaths
         Output paths for this job.
     asr_result : AsrResult
@@ -315,56 +323,81 @@ def _run_llm_stage(
         log_step("Plain-text mode enabled; skipped LLM steps", icon="⏭️")
         return replace(paths, written_paths=tuple(written_paths))
 
-    write_txt = config.plain_text or config.write_text
-    cues = build_cues(asr_result.words, config.max_chars_per_cue, config.max_seconds_per_cue)
-    if config.target_language:
-        if translator is None:
-            raise ValueError("translator is required when target_language is set")
-        log_step(f"Translation started: target={config.target_language}", icon="🌐")
-    translated_cues = translator.translate(cues) if config.target_language else cues
-    if optimizer is not None:
-        if (
-            paths.raw_source_srt is None
-            or paths.raw_source_txt is None
-            or paths.raw_target_srt is None
-            or paths.raw_target_txt is None
-            or paths.raw_bilingual_srt is None
-        ):
-            raise ValueError("raw subtitle paths are required when optimizer is enabled")
-        written_paths.extend(
-            _write_source_outputs(
-                paths.raw_source_srt,
-                paths.raw_source_txt,
-                translated_cues,
-                _plain_text(cue.source_text for cue in translated_cues),
-                write_txt,
-            )
-        )
+    if translator is None:
         if config.target_language:
-            written_paths.extend(
-                _write_target_outputs(
-                    paths.raw_target_srt,
-                    paths.raw_target_txt,
-                    paths.raw_bilingual_srt,
-                    translated_cues,
-                    config.translation_position,
-                    write_txt,
-                )
-            )
-            log_step(f"Raw translated outputs saved: {paths.raw_bilingual_srt}", icon="💾")
-    if optimizer is not None:
-        log_step("LLM subtitle optimization started", icon="🧠")
-        translated_cues = optimizer.optimize(translated_cues, asr_result.words)
-        log_step("LLM subtitle optimization completed", icon="✅")
+            raise ValueError("translator is required when target_language is set")
+        cues = build_cues(asr_result.words, config.max_chars_per_cue, config.max_seconds_per_cue)
+        written_paths.extend(_write_final_outputs(config, paths, cues))
+        log_step(f"Final source output saved: {paths.source_srt}", icon="✅")
+        return replace(paths, written_paths=tuple(written_paths))
 
+    if not config.target_language:
+        log_step("Sentence segmentation started", icon="✂️")
+        cues = build_cues_from_layouts(translator.segment(asr_result.words))
+        written_paths.extend(_write_final_outputs(config, paths, cues))
+        log_step(f"Final source output saved: {paths.source_srt}", icon="✅")
+        return replace(paths, written_paths=tuple(written_paths))
+
+    log_step(f"Translation started: target={config.target_language}", icon="🌐")
+    draft = translator.translate(asr_result.words)
+    sentences: Sequence[SentenceLayout] = draft.sentences
+    if config.review:
+        written_paths.extend(_write_raw_outputs(config, paths, build_cues_from_layouts(sentences)))
+        log_step(f"Raw translated outputs saved: {paths.raw_bilingual_srt}", icon="💾")
+        log_step("LLM subtitle review started", icon="🧠")
+        sentences = translator.review(draft)
+        log_step("LLM subtitle review completed", icon="✅")
+
+    written_paths.extend(_write_final_outputs(config, paths, build_cues_from_layouts(sentences)))
+    log_step(f"Final bilingual output saved: {paths.bilingual_srt}", icon="✅")
+    return replace(paths, written_paths=tuple(written_paths))
+
+
+def _write_raw_outputs(config: CaptionConfig, paths: OutputPaths, cues: list[SubtitleCue]) -> list[Path]:
+    """
+    Persist the pre-review translation so that review always starts from a saved state.
+
+    Raises
+    ------
+    ValueError
+        If the output layout carries no raw subtitle paths.
+    """
+    if (
+        paths.raw_source_srt is None
+        or paths.raw_source_txt is None
+        or paths.raw_target_srt is None
+        or paths.raw_target_txt is None
+        or paths.raw_bilingual_srt is None
+    ):
+        raise ValueError("raw subtitle paths are required when review is enabled")
+    written_paths = _write_source_outputs(
+        paths.raw_source_srt,
+        paths.raw_source_txt,
+        cues,
+        _plain_text(cue.source_text for cue in cues),
+        config.write_text,
+    )
     written_paths.extend(
-        _write_source_outputs(
-            paths.source_srt,
-            paths.source_txt,
-            translated_cues,
-            _plain_text(cue.source_text for cue in translated_cues),
-            write_txt,
+        _write_target_outputs(
+            paths.raw_target_srt,
+            paths.raw_target_txt,
+            paths.raw_bilingual_srt,
+            cues,
+            config.translation_position,
+            config.write_text,
         )
+    )
+    return written_paths
+
+
+def _write_final_outputs(config: CaptionConfig, paths: OutputPaths, cues: list[SubtitleCue]) -> list[Path]:
+    """Persist the final source outputs, plus target outputs when translation ran."""
+    written_paths = _write_source_outputs(
+        paths.source_srt,
+        paths.source_txt,
+        cues,
+        _plain_text(cue.source_text for cue in cues),
+        config.write_text,
     )
     if config.target_language:
         written_paths.extend(
@@ -372,16 +405,12 @@ def _run_llm_stage(
                 paths.target_srt,
                 paths.target_txt,
                 paths.bilingual_srt,
-                translated_cues,
+                cues,
                 config.translation_position,
-                write_txt,
+                config.write_text,
             )
         )
-        log_step(f"Final bilingual output saved: {paths.bilingual_srt}", icon="✅")
-    else:
-        log_step(f"Final source output saved: {paths.source_srt}", icon="✅")
-
-    return replace(paths, written_paths=tuple(written_paths))
+    return written_paths
 
 
 def _load_cached_asr_result(path: Path | None) -> AsrResult | None:

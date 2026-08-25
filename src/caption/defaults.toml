@@ -1,0 +1,57 @@
+# Built-in defaults. Any key omitted from the user's config.toml is taken from here.
+#
+# Only keys with a sensible default belong in this file. Credentials, the chat model
+# name, and the base URL are deliberately absent: omitting them means "not provided",
+# which must fail with a clear local error rather than silently resolve to a value.
+
+[llm]
+provider = "openai"
+concurrency = 4
+retries = 3
+request_timeout = 30
+enable_thinking = true
+reasoning_effort = "high"
+
+# Sampling parameters per generation mode, following the Qwen3 recommendations. The set
+# in use follows the per-task reasoning switch: [llm.thinking] for glossary extraction
+# and revision, [llm.instruct] for sentence splitting, translation, and scoring.
+#
+# top_k, min_p, and repetition_penalty are not OpenAI-standard and are sent through
+# extra_body; a server that does not implement them ignores them.
+#
+# presence_penalty is worth watching. Every request in this project asks for JSON, whose
+# key names necessarily repeat, and a high presence penalty discourages exactly that. The
+# vendor value of 1.5 is tuned for prose. Lower it first if responses stop parsing.
+
+[llm.thinking]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+min_p = 0.0
+presence_penalty = 0.0
+repetition_penalty = 1.0
+
+[llm.instruct]
+temperature = 0.7
+top_p = 0.80
+top_k = 20
+min_p = 0.0
+presence_penalty = 1.5
+repetition_penalty = 1.0
+
+[asr]
+model = "mlx-community/Qwen3-ASR-1.7B-8bit"
+aligner_model = "mlx-community/Qwen3-ForcedAligner-0.6B-8bit"
+
+[output]
+dir = "outputs"
+save_asr_json = true
+
+[subtitle]
+segmentation = "llm"
+target_lang = "zh"
+translation_position = "bottom"
+max_chars_per_cue = 60
+max_seconds_per_cue = 6.0
+review_rounds = 2
+review_pass_score = 4
