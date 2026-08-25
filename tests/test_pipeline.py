@@ -1,9 +1,11 @@
+from dataclasses import replace
 from pathlib import Path
+import threading
 
 import pytest
 
-from caption.pipeline import process_job
-from caption.types import AsrResult, CaptionConfig, MediaJob, SubtitleCue, WordSpan
+from caption.pipeline import process_job, run_pipeline
+from caption.types import AsrResult, CaptionConfig, MediaJob, OutputPaths, SubtitleCue, WordSpan
 
 
 class FakeAsr:
@@ -207,3 +209,87 @@ def test_process_job_rejects_invalid_asr_cache(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="invalid ASR cache file"):
         process_job(job, config, asr=ExplodingAsr(), translator=FakeTranslator(), optimizer=None, save_asr_json=True)
+
+
+class RecordingAsr:
+    """ASR fake that records call order and optionally blocks on the second call."""
+
+    def __init__(self, on_second_call: threading.Event | None = None, release: threading.Event | None = None) -> None:
+        self.calls: list[str] = []
+        self.on_second_call = on_second_call
+        self.release = release
+
+    def transcribe(self, audio_path: Path, language: str | None = None) -> AsrResult:
+        self.calls.append(audio_path.name)
+        if len(self.calls) == 2:
+            if self.on_second_call is not None:
+                self.on_second_call.set()
+            if self.release is not None:
+                self.release.wait(timeout=1.0)
+        return AsrResult(
+            text="Hello world.",
+            language="English",
+            words=[WordSpan("Hello", 0.0, 0.4), WordSpan("world.", 0.4, 1.0)],
+            chunks=[],
+        )
+
+
+def _write_fake_media(tmp_path: Path, names: tuple[str, ...]) -> None:
+    for name in names:
+        (tmp_path / name).write_bytes(b"fake")
+
+
+def test_run_pipeline_overlaps_asr_with_translation(tmp_path: Path) -> None:
+    _write_fake_media(tmp_path, ("a.wav", "b.wav"))
+    second_asr_started = threading.Event()
+
+    class GatedTranslator:
+        def translate(self, cues: list[SubtitleCue]) -> list[SubtitleCue]:
+            assert second_asr_started.wait(timeout=10), "translation must overlap with the next file's ASR"
+            return [replace(cue, target_text="你好，世界。") for cue in cues]
+
+    asr = RecordingAsr(on_second_call=second_asr_started)
+    outputs = run_pipeline(
+        tmp_path,
+        tmp_path / "out",
+        CaptionConfig(source_language="English", target_language="zh"),
+        asr=asr,
+        translator=GatedTranslator(),
+    )
+
+    assert asr.calls == ["a.wav", "b.wav"]
+    assert [output.bilingual_srt.name for output in outputs] == ["a.bilingual.srt", "b.bilingual.srt"]
+    assert all(output.bilingual_srt.exists() for output in outputs)
+
+
+def test_run_pipeline_stops_asr_after_translation_failure(tmp_path: Path) -> None:
+    _write_fake_media(tmp_path, ("a.wav", "b.wav", "c.wav"))
+    asr = RecordingAsr(release=threading.Event())
+
+    with pytest.raises(RuntimeError, match="translation failed"):
+        run_pipeline(
+            tmp_path,
+            tmp_path / "out",
+            CaptionConfig(source_language="English", target_language="zh"),
+            asr=asr,
+            translator=FailingTranslator(),
+        )
+
+    assert asr.calls == ["a.wav", "b.wav"]
+
+
+def test_run_pipeline_without_llm_stays_sequential(tmp_path: Path) -> None:
+    _write_fake_media(tmp_path, ("a.wav", "b.wav"))
+    asr = RecordingAsr()
+
+    outputs = run_pipeline(
+        tmp_path,
+        tmp_path / "out",
+        CaptionConfig(source_language="English", target_language=None, plain_text=True),
+        asr=asr,
+        translator=None,
+    )
+
+    assert asr.calls == ["a.wav", "b.wav"]
+    assert [output.asr_srt.name for output in outputs] == ["a.asr.srt", "b.asr.srt"]
+    assert all(output.asr_srt.exists() for output in outputs)

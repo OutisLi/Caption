@@ -145,7 +145,7 @@ caption /path/to/media_folder
 6. 如果 `config.toml` 中 `subtitle.optimize = true`，LLM 会按配置窗口结合时间戳重新做语义分句和字幕优化。
 7. 写出 `final/` SRT；传入 `--text` 时同时写出 TXT。
 
-运行时会用 `tqdm` 显示 ASR chunk、翻译 batch、优化窗口等可计数进度；阶段性事件会用简短日志打印。
+运行时会用 `tqdm` 显示 ASR chunk、翻译 batch、优化窗口等可计数进度；阶段性事件会用简短日志打印。处理多个文件且启用翻译/优化时，下一个文件的语音识别会与当前文件的 LLM 阶段并行执行，ASR 结果落盘后才进入 LLM 阶段。
 
 ## 验证
 

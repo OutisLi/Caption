@@ -68,7 +68,7 @@ Do not add low-frequency runtime knobs to the CLI unless explicitly requested.
 - `src/caption/config.py`: TOML config loading.
 - `src/caption/media.py`: media discovery and output path derivation only.
 - `src/caption/asr_mlx.py`: MLX Qwen3-ASR adapter only.
-- `src/caption/pipeline.py`: stage orchestration and incremental file writes.
+- `src/caption/pipeline.py`: stage orchestration and incremental file writes. ASR (producer thread) overlaps the LLM stage (consumer) across files when translation or optimization is active.
 - `src/caption/translator.py`: LLM translation/optimization orchestration.
 - `src/caption/prompts.py`: prompt builders only.
 - `src/caption/llm_json.py`: JSON parsing and validation only.
@@ -89,6 +89,7 @@ Keep files focused. Do not create large multi-purpose modules.
 - Do not silently fall back from optimized subtitles to raw subtitles.
 - Retry optimization according to `llm.optimization_retries`.
 - If a stage succeeds, persist its output before starting the next stage.
+- When the LLM stage is active, ASR for the next file runs concurrently with the current file's LLM work; ASR artifacts must be persisted before a job enters the LLM stage. Without an LLM stage, files are processed sequentially.
 - When `asr/*.asr.json` already exists for a media file, reuse it and skip ASR. Invalid cache files must raise an error instead of triggering re-transcription.
 - Keep output layout centralized in `src/caption/media.py`: ASR artifacts under `asr/`, unoptimized LLM artifacts under `raw/`, final artifacts under `final/`.
 - For folder inputs, preserve only the input root's internal relative layout. Never include parent directories before the user-provided input root.

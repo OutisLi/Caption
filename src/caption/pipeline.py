@@ -1,6 +1,8 @@
 """End-to-end caption generation pipeline."""
 
 import json
+import queue
+import threading
 from collections.abc import Iterable
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -117,10 +119,75 @@ def run_pipeline(
     if not jobs:
         raise ValueError(f"no media files found under {input_path}")
     log_step(f"Discovered {len(jobs)} media file(s)", icon="🔎")
+    if _can_overlap_stages(config, translator, optimizer):
+        return _run_overlapped(jobs, config, asr, translator, optimizer, save_asr_json)
     outputs: list[OutputPaths] = []
     for index, job in enumerate(jobs, start=1):
         log_step(f"Processing file {index}/{len(jobs)}: {job.input_path}", icon="📄")
         outputs.append(process_job(job, config, asr, translator, optimizer, save_asr_json))
+    return outputs
+
+
+def _can_overlap_stages(config: CaptionConfig, translator: Translator | None, optimizer: CaptionOptimizer | None) -> bool:
+    """Return whether ASR and LLM stages can overlap across files."""
+    return not config.plain_text and (translator is not None or optimizer is not None)
+
+
+_PIPELINE_SENTINEL = object()
+
+
+def _run_overlapped(
+    jobs: list[MediaJob],
+    config: CaptionConfig,
+    asr: AsrEngine,
+    translator: Translator | None,
+    optimizer: CaptionOptimizer | None,
+    save_asr_json: bool,
+) -> list[OutputPaths]:
+    """
+    Overlap ASR with LLM stages across files.
+
+    A producer thread runs ASR one file at a time and hands results to the
+    consumer (translation/optimization) through a queue, so file N+1 is
+    transcribed while file N is still being translated. Failures in either
+    stage abort the run; the producer finishes its in-flight file first so
+    its ASR artifacts stay usable as cache on the next run.
+    """
+    work_queue: queue.Queue[object] = queue.Queue()
+    stop = threading.Event()
+
+    def produce() -> None:
+        try:
+            for index, job in enumerate(jobs, start=1):
+                if stop.is_set():
+                    break
+                log_step(f"Processing file {index}/{len(jobs)}: {job.input_path}", icon="📄")
+                paths = build_output_paths(job.output_dir, job.relative_output_dir, job.stem, save_asr_json)
+                asr_result, written_paths = _run_asr_stage(job, config, asr, paths)
+                work_queue.put((paths, asr_result, written_paths))
+        except Exception as exc:
+            work_queue.put(exc)
+        finally:
+            work_queue.put(_PIPELINE_SENTINEL)
+
+    producer = threading.Thread(target=produce, name="caption-asr-producer", daemon=True)
+    producer.start()
+
+    outputs: list[OutputPaths] = []
+    try:
+        while True:
+            item = work_queue.get()
+            if item is _PIPELINE_SENTINEL:
+                break
+            if isinstance(item, Exception):
+                raise item
+            paths, asr_result, written_paths = item  # type: ignore[misc]
+            outputs.append(_run_llm_stage(config, translator, optimizer, paths, asr_result, written_paths))
+    except Exception:
+        stop.set()
+        producer.join()
+        raise
+    producer.join()
     return outputs
 
 
@@ -161,6 +228,29 @@ def process_job(
         If ASR returns no timestamped words.
     """
     paths = build_output_paths(job.output_dir, job.relative_output_dir, job.stem, save_asr_json)
+    asr_result, written_paths = _run_asr_stage(job, config, asr, paths)
+    return _run_llm_stage(config, translator, optimizer, paths, asr_result, written_paths)
+
+
+def _run_asr_stage(
+    job: MediaJob,
+    config: CaptionConfig,
+    asr: AsrEngine,
+    paths: OutputPaths,
+) -> tuple[AsrResult, list[Path]]:
+    """
+    Run the ASR stage for one job: transcribe (or reuse the cache) and persist ASR artifacts.
+
+    Returns
+    -------
+    tuple[AsrResult, list[Path]]
+        ASR result and the paths written by this stage.
+
+    Raises
+    ------
+    ValueError
+        If ASR returns no timestamped words.
+    """
     written_paths: list[Path] = []
 
     asr_result = _load_cached_asr_result(paths.asr_json)
@@ -182,10 +272,51 @@ def process_job(
     asr_text = _asr_plain_text(asr_result, cues)
     written_paths.extend(_write_source_outputs(paths.asr_srt, paths.asr_txt, cues, asr_text, write_txt))
     log_step(f"ASR text outputs saved: {_format_paths(written_paths)}", icon="💾")
+    return asr_result, written_paths
+
+
+def _run_llm_stage(
+    config: CaptionConfig,
+    translator: Translator | None,
+    optimizer: CaptionOptimizer | None,
+    paths: OutputPaths,
+    asr_result: AsrResult,
+    written_paths: list[Path],
+) -> OutputPaths:
+    """
+    Run the LLM stage for one job: translation, optional optimization, raw/final writes.
+
+    Parameters
+    ----------
+    config : CaptionConfig
+        Caption generation configuration.
+    translator : Translator | None
+        Optional translator. Required only for target-language translation.
+    optimizer : CaptionOptimizer | None
+        Optional subtitle text optimizer.
+    paths : OutputPaths
+        Output paths for this job.
+    asr_result : AsrResult
+        ASR result from the ASR stage.
+    written_paths : list[Path]
+        Paths already written by the ASR stage.
+
+    Returns
+    -------
+    OutputPaths
+        Generated output paths.
+
+    Raises
+    ------
+    ValueError
+        If translation is requested without a translator.
+    """
     if config.plain_text:
         log_step("Plain-text mode enabled; skipped LLM steps", icon="⏭️")
         return replace(paths, written_paths=tuple(written_paths))
 
+    write_txt = config.plain_text or config.write_text
+    cues = build_cues(asr_result.words, config.max_chars_per_cue, config.max_seconds_per_cue)
     if config.target_language:
         if translator is None:
             raise ValueError("translator is required when target_language is set")
