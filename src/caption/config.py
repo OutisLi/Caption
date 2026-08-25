@@ -19,6 +19,7 @@ class LlmSettings:
     reasoning_effort: str
     concurrency: int
     optimization_retries: int
+    request_timeout: float
 
 
 @dataclass(frozen=True)
@@ -107,5 +108,6 @@ def load_runtime_config(path: Path) -> RuntimeConfig:
             reasoning_effort=str(llm.get("reasoning_effort", "high")),
             concurrency=int(llm.get("concurrency", 4)),
             optimization_retries=int(llm.get("optimization_retries", 3)),
+            request_timeout=float(llm.get("request_timeout", 30.0)),
         ),
     )

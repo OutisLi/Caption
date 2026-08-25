@@ -55,6 +55,7 @@ class OpenAIChatCompletionClient:
     model: str
     enable_thinking: bool = True
     reasoning_effort: str = "high"
+    request_timeout: float = 30.0
 
     async def complete_json(self, system_prompt: str, user_prompt: str) -> str:
         """
@@ -75,19 +76,24 @@ class OpenAIChatCompletionClient:
         Raises
         ------
         TranslationError
-            If the provider returns an empty response or request error.
+            If the request times out, or the provider returns an empty response or request error.
         """
         try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.2,
-                response_format={"type": "json_object"},
-                **self._thinking_kwargs(),
+            response = await asyncio.wait_for(
+                self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.2,
+                    response_format={"type": "json_object"},
+                    **self._thinking_kwargs(),
+                ),
+                timeout=self.request_timeout,
             )
+        except asyncio.TimeoutError as exc:
+            raise TranslationError(f"LLM request timed out after {self.request_timeout:.0f}s") from exc
         except OpenAIError as exc:
             raise TranslationError(f"LLM request failed: {exc}") from exc
         content = response.choices[0].message.content
@@ -438,6 +444,7 @@ def create_llm_completion_client(
     model: str,
     enable_thinking: bool = True,
     reasoning_effort: str = "high",
+    request_timeout: float = 30.0,
 ) -> JsonCompletionClient:
     """
     Create a provider-specific JSON completion adapter.
@@ -456,6 +463,8 @@ def create_llm_completion_client(
         Whether OpenAI-compatible thinking parameters are enabled.
     reasoning_effort : str
         Reasoning effort for OpenAI-compatible APIs.
+    request_timeout : float
+        Per-request timeout in seconds for OpenAI-compatible APIs.
 
     Returns
     -------
@@ -474,6 +483,7 @@ def create_llm_completion_client(
             model=model,
             enable_thinking=enable_thinking,
             reasoning_effort=reasoning_effort,
+            request_timeout=request_timeout,
         )
     if normalized_provider == "anthropic":
         return AnthropicMessagesClient(

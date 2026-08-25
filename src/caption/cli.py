@@ -141,6 +141,7 @@ def main(argv: list[str] | None = None) -> int:
                 model=llm.model,
                 enable_thinking=llm.enable_thinking,
                 reasoning_effort=llm.reasoning_effort,
+                request_timeout=llm.request_timeout,
             )
             log_step(f"LLM preflight started: provider={llm.provider}, model={llm.model}", icon="🔎")
             validate_llm_completion_client(completion_client)

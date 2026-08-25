@@ -1,6 +1,9 @@
+import asyncio
+
 import pytest
 
 from caption.translator import (
+    OpenAIChatCompletionClient,
     OpenAICompatibleTranslator,
     TranslationError,
     apply_translations,
@@ -254,3 +257,23 @@ def test_optimizer_retries_invalid_timestamps_and_raises_after_retry_budget() ->
     with pytest.raises(TranslationError):
         translator.optimize(cues)
     assert len(client.chat.completions.calls) == 2
+
+
+class SlowCompletions:
+    async def create(self, **kwargs: object) -> FakeResponse:
+        await asyncio.sleep(5)
+        return FakeResponse('{"ok": true}')
+
+
+class SlowClient:
+    def __init__(self) -> None:
+        self.chat = type("Chat", (), {"completions": SlowCompletions()})()
+
+
+def test_openai_client_request_timeout_raises_translation_error() -> None:
+    client = OpenAIChatCompletionClient(
+        client=SlowClient(), model="test-model", enable_thinking=False, request_timeout=0.05
+    )
+
+    with pytest.raises(TranslationError, match="timed out"):
+        asyncio.run(client.complete_json("system", "user"))

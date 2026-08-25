@@ -1,6 +1,7 @@
 [llm]
 concurrency = 5
 optimization_retries = 20
+request_timeout = 30
 provider = "openai"  # openai or anthropic
 base_url = "https://api.deepseek.com"
 model = "deepseek-v4-flash"

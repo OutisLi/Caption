@@ -45,7 +45,7 @@ Runtime settings belong in local `config.toml`, not in source code. Create it fr
 
 Keep these in `config.toml`:
 
-- LLM API key, base URL, model, thinking settings, concurrency, retry count. These are required only when translation or optimization uses the LLM.
+- LLM API key, base URL, model, thinking settings, concurrency, retry count, request timeout. These are required only when translation or optimization uses the LLM.
 - ASR model paths and model cache directory.
 - Output directory and ASR JSON persistence.
 - Subtitle formatting, optimization settings, and the default target language (`subtitle.target_lang`).
